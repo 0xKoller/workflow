@@ -1,0 +1,50 @@
+---
+title: deployment-mismatch
+description: A workflow run was delivered to a deployment other than the one that created it.
+type: troubleshooting
+summary: Understand why a run fails with DEPLOYMENT_MISMATCH and how cross-deployment routing happens.
+prerequisites:
+  - /docs/foundations/workflows-and-steps
+related:
+  - /docs/errors/runtime-decryption-failed
+  - /docs/foundations/errors-and-retries
+---
+
+A run is pinned to the deployment that created it. When a queued workflow or step callback is delivered to a **different** deployment, the run is failed immediately with the `DEPLOYMENT_MISMATCH` classification instead of executing there.
+
+This is an SDK/runtime signal, not an error thrown by your workflow code, and it is not catchable inside a workflow function.
+
+## Error Message
+
+```
+Workflow run "wrun_..." belongs to deployment "dpl_A", but was received by deployment "dpl_B". The run was stopped to protect against code-skew errors. Verify that the original deployment is still available and that queue callbacks are routed to it.
+```
+
+## Why This Happens
+
+Every run records the `deploymentId` that started it, and its queued workflow and step callbacks are expected to execute on that same deployment. Continuing on a different one is unsafe:
+
+1. **Code skew.** The workflow and step bundles on the receiving deployment may not match the code that produced the run's recorded history, so replay could diverge or produce incorrect results.
+2. **Encryption.** Step inputs and other event-log payloads are encrypted with a per-run key derived from the **originating** deployment's key material. A different deployment derives the wrong key and cannot decrypt them — previously the source of a confusing [runtime-decryption-failed](/docs/errors/runtime-decryption-failed) that exhausted retries with no clear cause.
+
+The most common trigger is a **preview redeploy**. You load an app served by deployment A, push a new deployment B, then trigger a workflow without reloading. Deployment-skew protection routes the initial request to A (which creates the run), but A has been superseded and its queue callbacks re-route to B. B sees that the run belongs to A and stops it rather than running it against potentially-different code.
+
+## What To Do
+
+- **Re-run from the current deployment.** Trigger the workflow again from your latest deployment (or use the **Re-run** button in the Workflow Dashboard). The new run is owned by the current deployment, so all of its callbacks route consistently.
+- **Avoid triggering runs across a redeploy.** Reload the page after deploying so requests are served by, and runs are created on, the new deployment.
+- **Keep the originating deployment available** for the lifetime of its runs. A run whose deployment has been deleted or has aged out cannot be resumed and must be re-run.
+
+## This Error Cannot Be Caught
+
+Like other runtime signals, `DEPLOYMENT_MISMATCH` is **not catchable** inside your workflow function — the run is failed before any workflow or step code executes. Check the run status from outside instead:
+
+```typescript lineNumbers
+import { getRun } from "workflow/api";
+
+const run = getRun("wrun_abc123");
+const status = await run.status;
+if (status === "failed") {
+  console.error("Run failed");
+}
+```
