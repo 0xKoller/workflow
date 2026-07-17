@@ -62,6 +62,7 @@ import {
   queueMessage,
   withHealthCheck,
 } from './helpers.js';
+import { COMPUTE_INSTANCE_ID } from './compute-instance.js';
 import { safeWaitUntil } from './wait-until.js';
 import { getWorld, getWorldHandlers, type WorldHandlers } from './world.js';
 
@@ -243,6 +244,7 @@ function createStepHandler(namespace?: string) {
             span?.setAttributes({
               ...Attribute.StepName(stepName),
               ...Attribute.StepAttempt(metadata.attempt),
+              ...Attribute.FaasInstance(COMPUTE_INSTANCE_ID),
               // Standard OTEL messaging conventions
               ...Attribute.MessagingSystem('vercel-queue'),
               ...Attribute.MessagingDestinationName(metadata.queueName),

@@ -175,6 +175,15 @@ export const WorkflowRouteModuleBodyInitMs = SemanticConvention<number>(
   'workflow.route.module_body_init_ms'
 );
 
+/**
+ * The synthesized `COMPUTE_INSTANCE_ID` of the compute instance handling this
+ * route — Vercel exposes no native one under Fluid compute. Uses the
+ * OpenTelemetry `faas.instance` convention (execution-environment id, reusable
+ * across invocations to the same function). See
+ * https://opentelemetry.io/docs/specs/semconv/attributes-registry/faas/
+ */
+export const FaasInstance = SemanticConvention<string>('faas.instance');
+
 // Step attributes
 
 /** Name of the step function being executed */
