@@ -330,8 +330,8 @@ describe('runtime batch step transitions', () => {
   it('kill switch (WORKFLOW_BATCH_TRANSITIONS=0): never calls createBatch and keeps the two-POST-per-step pattern', async () => {
     // The emergency kill switch restores the exact single-event two-POST path —
     // byte-identical to pre-feature behavior even when the World implements
-    // createBatch. '0' and 'false' both disable; assert with '0' here (the
-    // attr-ordering suite covers 'false' equivalence).
+    // createBatch. '0' and 'false' both disable (constants.ts parses either);
+    // this asserts with '0', the 'false' equivalence is asserted below.
     process.env.WORKFLOW_BATCH_TRANSITIONS = '0';
     const { created, createBatch } = await driveRun({
       runId: 'wrun_batch_off',
@@ -346,6 +346,21 @@ describe('runtime batch step transitions', () => {
       expect(startedFor(created, id)).toHaveLength(1);
       expect(completedFor(created, id)).toHaveLength(1);
     }
+    expect(created.some((d) => d.eventType === 'run_completed')).toBe(true);
+  });
+
+  it("kill switch (WORKFLOW_BATCH_TRANSITIONS=false): the literal string 'false' also disables batching", async () => {
+    // constants.ts disables on raw === '0' || raw.toLowerCase() === 'false', so
+    // the word form must behave identically to '0' — proven, not just asserted
+    // in a comment.
+    process.env.WORKFLOW_BATCH_TRANSITIONS = 'false';
+    const { created, createBatch } = await driveRun({
+      runId: 'wrun_batch_off_false',
+      withBatch: true,
+    });
+
+    expect(createBatch).not.toHaveBeenCalled();
+    expect(startedStepIds(created)).toHaveLength(3);
     expect(created.some((d) => d.eventType === 'run_completed')).toBe(true);
   });
 
