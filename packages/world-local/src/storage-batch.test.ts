@@ -44,6 +44,36 @@ const startedFrame = (stepId: string, stepName: string): CreateEventRequest =>
     eventData: { stepName },
   }) as CreateEventRequest;
 
+// A bare step_created with no paired step_started is a queued (pending) fan-out
+// step — the client will dispatch it to a background handler, not inline.
+const pendingFrame = createdFrame;
+
+const waitCreatedFrame = (waitId: string, resumeAt: Date): CreateEventRequest =>
+  ({
+    eventType: 'wait_created',
+    specVersion: SPEC_VERSION_CURRENT,
+    correlationId: waitId,
+    eventData: { resumeAt },
+  }) as CreateEventRequest;
+
+const hookReceivedFrame = (
+  hookId: string,
+  payload: Uint8Array
+): CreateEventRequest =>
+  ({
+    eventType: 'hook_received',
+    specVersion: SPEC_VERSION_CURRENT,
+    correlationId: hookId,
+    eventData: { token: hookId, payload },
+  }) as CreateEventRequest;
+
+const runCompletedFrame = (output: Uint8Array): CreateEventRequest =>
+  ({
+    eventType: 'run_completed',
+    specVersion: SPEC_VERSION_CURRENT,
+    eventData: { output },
+  }) as CreateEventRequest;
+
 // Born-run a step the way the single-event path does for a fresh next step: a
 // lazy step_started whose eventData carries the input (world-local folds the
 // step_created + running transition from it).
@@ -332,5 +362,154 @@ describe('world-local events.createBatch', () => {
         batchId: 'bat_prev2',
       })
     ).rejects.toMatchObject({ code: 'run-not-versioned', status: 409 });
+  });
+
+  // ---- v2 full suspension grammar (collect-mode) -------------------------
+  // The fenced path accepts a whole suspension's event set, not just the
+  // sequential triple: a leading outcome, fan-out (pending) creates, inline
+  // born-running steps, waits, hook_received, and a trailing terminal.
+
+  it('v2 grammar: fans out pending creates alongside one inline born-run in one batch', async () => {
+    const runId = await freshRunWithStepN();
+    // completed(N), two queued fan-out creates (p1, p2), one inline born-run (M).
+    const batch = await storage.events.createBatch(
+      runId,
+      [
+        completedFrame('stepN', new Uint8Array([9])),
+        pendingFrame('p1', 'fan-1', new Uint8Array([1])),
+        pendingFrame('p2', 'fan-2', new Uint8Array([2])),
+        createdFrame('stepM', 'step-m', new Uint8Array([3])),
+        startedFrame('stepM', 'step-m'),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_fanout' }
+    );
+
+    // One positional result per input frame.
+    expect(batch.results).toHaveLength(5);
+    // Leading outcome and pending creates carry NO stepCreated (the server
+    // stamps it only on a born-running started frame).
+    expect(batch.results[0].stepCreated).toBeUndefined();
+    expect(batch.results[1].stepCreated).toBeUndefined();
+    expect(batch.results[2].stepCreated).toBeUndefined();
+    // Born-run M: the created-frame result has no stepCreated; the started
+    // frame does — this caller won M's claim and runs its body.
+    expect(batch.results[3].stepCreated).toBeUndefined();
+    expect(batch.results[4].stepCreated).toBe(true);
+    expect(batch.results[4].step?.status).toBe('running');
+    expect(batch.runVersion).toBe(1);
+
+    // Durable state: N completed, fan-out steps pending, M running.
+    expect((await storage.steps.get(runId, 'stepN')).status).toBe('completed');
+    const p1 = await storage.steps.get(runId, 'p1');
+    expect(p1.status).toBe('pending');
+    expect(p1.input).toEqual(new Uint8Array([1]));
+    expect((await storage.steps.get(runId, 'p2')).status).toBe('pending');
+    expect((await storage.steps.get(runId, 'stepM')).status).toBe('running');
+
+    // Every frame is a durable event in request order.
+    const types = (await listEvents(storage, runId)).map((e) => e.eventType);
+    expect(types).toEqual(
+      expect.arrayContaining(['step_completed', 'step_created', 'step_started'])
+    );
+    // stepN's create (from freshRunWithStepN) plus p1 + p2 + M from the batch.
+    expect(types.filter((t) => t === 'step_created')).toHaveLength(4);
+  });
+
+  it('v2 grammar: batches a wait_created and a hook_received', async () => {
+    const runId = await freshRunWithStepN();
+    // hook_received requires the hook to exist — create it first (a plain
+    // fire-and-forget hook lives on the single-event path, not the batch).
+    await storage.events.create(runId, {
+      eventType: 'hook_created',
+      specVersion: SPEC_VERSION_CURRENT,
+      correlationId: 'hook-1',
+      eventData: { token: 'hook-1', isWebhook: false },
+    } as CreateEventRequest);
+    const resumeAt = new Date(Date.now() + 60_000);
+    const batch = await storage.events.createBatch(
+      runId,
+      [
+        completedFrame('stepN', new Uint8Array([9])),
+        waitCreatedFrame('wait-1', resumeAt),
+        hookReceivedFrame('hook-1', new Uint8Array([7])),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_waithook' }
+    );
+
+    expect(batch.results).toHaveLength(3);
+    // No step claims in this batch.
+    for (const r of batch.results) expect(r.stepCreated).toBeUndefined();
+    // The wait op materializes a waiting wait entity.
+    expect(batch.results[1].wait?.status).toBe('waiting');
+    expect(batch.runVersion).toBe(1);
+
+    const types = (await listEvents(storage, runId)).map((e) => e.eventType);
+    expect(types).toContain('wait_created');
+    expect(types).toContain('hook_received');
+  });
+
+  it('v2 grammar: folds a terminal run_completed into the same fenced commit', async () => {
+    const runId = await freshRunWithStepN();
+    const batch = await storage.events.createBatch(
+      runId,
+      [
+        completedFrame('stepN', new Uint8Array([9])),
+        runCompletedFrame(new Uint8Array([42])),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_terminal' }
+    );
+
+    expect(batch.results).toHaveLength(2);
+    expect(batch.runVersion).toBe(1);
+    expect(batch.lastBatchId).toBe('bat_terminal');
+
+    // The run is completed AND still carries the advanced fence — the terminal
+    // status write and the fence advance coexist on the one run row.
+    const run = await storage.runs.get(runId);
+    expect(run.status).toBe('completed');
+    expect(run.runVersion).toBe(1);
+    expect(run.lastBatchId).toBe('bat_terminal');
+    expect((await storage.steps.get(runId, 'stepN')).status).toBe('completed');
+  });
+
+  it('v2 grammar: rejects a terminal that is not last, and a step referenced twice', async () => {
+    const runId = await freshRunWithStepN();
+    // Terminal not last.
+    await expect(
+      storage.events.createBatch(
+        runId,
+        [
+          runCompletedFrame(new Uint8Array([1])),
+          createdFrame('stepM', 'step-m', new Uint8Array([2])),
+          startedFrame('stepM', 'step-m'),
+        ],
+        { expectedRunVersion: 0, batchId: 'bat_badterm' }
+      )
+    ).rejects.toBeInstanceOf(WorkflowWorldError);
+
+    // Same step id in two operations.
+    await expect(
+      storage.events.createBatch(
+        runId,
+        [
+          createdFrame('dup', 'step-dup', new Uint8Array([1])),
+          startedFrame('dup', 'step-dup'),
+          pendingFrame('dup', 'step-dup', new Uint8Array([1])),
+        ],
+        { expectedRunVersion: 0, batchId: 'bat_dup2' }
+      )
+    ).rejects.toBeInstanceOf(WorkflowWorldError);
+  });
+
+  it('rejects the full grammar on the UNFENCED (legacy) path', async () => {
+    const runId = await freshRunWithStepN();
+    // A fan-out (two bare creates) is valid v2 grammar but not the v1 triple;
+    // without a batchId fence it must be rejected.
+    await expect(
+      storage.events.createBatch(runId, [
+        pendingFrame('p1', 'fan-1', new Uint8Array([1])),
+        pendingFrame('p2', 'fan-2', new Uint8Array([2])),
+      ])
+    ).rejects.toBeInstanceOf(WorkflowWorldError);
   });
 });

@@ -384,6 +384,120 @@ async function pinCanonicalEventIdForLegacyClaim(
  * locking standpoint. Cross-instance / cross-process arbitration
  * relies on the on-disk constraint / claim files instead.
  */
+/**
+ * A classified suspension-batch operation, tagged by role, keyed to the input
+ * event position(s) that produced it. Module-level so `createBatch` stays
+ * bounded in complexity; mirrors the server's `BatchOp`.
+ */
+type LocalBatchOp =
+  | { kind: 'outcome'; index: number; req: CreateEventRequest }
+  | {
+      kind: 'step-run';
+      createdIndex: number;
+      startedIndex: number;
+      created: CreateEventRequest;
+      started: CreateEventRequest;
+    }
+  | { kind: 'step-pending'; index: number; req: CreateEventRequest }
+  | { kind: 'wait'; index: number; req: CreateEventRequest }
+  | { kind: 'hook-received'; index: number; req: CreateEventRequest }
+  | { kind: 'terminal'; index: number; req: CreateEventRequest };
+
+/**
+ * Validate a suspension batch against the grammar and classify its ordered
+ * events into positional {@link LocalBatchOp}s, mirroring workflow-server's
+ * `classifySuspensionBatch` (lib/data/events.ts). Throws `WorkflowWorldError`
+ * on any grammar violation. Pure — no I/O. Callers gate the full grammar on the
+ * fence (the unfenced path additionally restricts to the v1 triple).
+ */
+function classifyLocalSuspensionBatch(
+  batchEvents: CreateEventRequest[]
+): LocalBatchOp[] {
+  const ops: LocalBatchOp[] = [];
+  const seenSteps = new Set<string>();
+  const claimStep = (req: CreateEventRequest, index: number): void => {
+    const id = req.correlationId;
+    if (typeof id !== 'string') {
+      throw new WorkflowWorldError(
+        `world-local: createBatch event ${index} (${req.eventType}) requires a correlationId`
+      );
+    }
+    if (seenSteps.has(id)) {
+      throw new WorkflowWorldError(
+        `world-local: createBatch references step ${id} more than once`
+      );
+    }
+    seenSteps.add(id);
+  };
+
+  let i = 0;
+  const first = batchEvents[0].eventType;
+  if (first === 'step_completed' || first === 'step_failed') {
+    claimStep(batchEvents[0], 0);
+    ops.push({ kind: 'outcome', index: 0, req: batchEvents[0] });
+    i = 1;
+  }
+  while (i < batchEvents.length) {
+    const e = batchEvents[i];
+    if (e.eventType === 'step_completed' || e.eventType === 'step_failed') {
+      throw new WorkflowWorldError(
+        `world-local: a ${e.eventType} may only lead a suspension batch (index 0)`
+      );
+    }
+    if (e.eventType === 'run_completed' || e.eventType === 'run_failed') {
+      if (i !== batchEvents.length - 1) {
+        throw new WorkflowWorldError(
+          `world-local: a terminal ${e.eventType} must be the last batch event`
+        );
+      }
+      ops.push({ kind: 'terminal', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    if (e.eventType === 'step_created') {
+      claimStep(e, i);
+      const next = batchEvents[i + 1];
+      if (
+        next &&
+        next.eventType === 'step_started' &&
+        next.correlationId === e.correlationId
+      ) {
+        ops.push({
+          kind: 'step-run',
+          createdIndex: i,
+          startedIndex: i + 1,
+          created: e,
+          started: next,
+        });
+        i += 2;
+      } else {
+        ops.push({ kind: 'step-pending', index: i, req: e });
+        i += 1;
+      }
+      continue;
+    }
+    if (e.eventType === 'step_started') {
+      throw new WorkflowWorldError(
+        'world-local: a step_started must be immediately preceded by its step_created'
+      );
+    }
+    if (e.eventType === 'wait_created' || e.eventType === 'wait_completed') {
+      ops.push({ kind: 'wait', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    if (e.eventType === 'hook_received') {
+      ops.push({ kind: 'hook-received', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    throw new WorkflowWorldError(
+      `world-local: unsupported eventType '${e.eventType}' in a suspension batch`
+    );
+  }
+  return ops;
+}
+
 function withInProcessLock<T>(
   locks: Map<string, Promise<unknown>>,
   key: string,
@@ -2307,35 +2421,47 @@ export function createEventsStorage(
     },
 
     /**
-     * Batch step transition (WORKFLOW_BATCH_TRANSITIONS). Applies the ordered
-     * transition [step_completed(N), step_created(N+1), step_started(N+1)] for
-     * one run — the same shape workflow-server#646 commits atomically over HTTP.
+     * Suspension batch (WORKFLOW_BATCH_TRANSITIONS). Applies one workflow
+     * suspension's ordered event set for a run in a single call — the same shape
+     * workflow-server#646 commits atomically over HTTP. The v1 step-transition
+     * triple [step_completed?, step_created, step_started] is now just one legal
+     * shape; the fenced v2 path additionally accepts the full grammar (mirrors
+     * the server's `classifySuspensionBatch`):
      *
-     * Composition over reimplementation: the transition is exactly "complete
-     * step N, then born-run step N+1", and the single-`create` path already has
-     * a battle-tested born-running fold (the lazy `step_started` that carries
-     * the step-creation `input`: it writes the step entity, a synthetic
-     * `step_created` event, transitions to running, and stamps `stepCreated` on
-     * the create-claim winner). So `createBatch` drives `create` twice —
-     * `step_completed(N)` then a lazy born-running `step_started(N+1)` — which
-     * makes the durable state BYTE-IDENTICAL to what the kill-switch (two-POST)
-     * path produces, the strongest guarantee for a default-on change.
+     *   (step_completed | step_failed)?          # leading outcome (index 0)
+     *   ( wait_created | wait_completed | hook_received
+     *     | (step_created step_started)          # inline born-running step
+     *     | step_created )*                      # queued (pending) fan-out step
+     *   (run_completed | run_failed)?            # terminal, MUST be last
+     *
+     * The UNFENCED (legacy / direct-test) path keeps the triple-only contract;
+     * the full grammar is admitted only when a `batchId` fence is present, which
+     * the runtime always supplies for a v2 run — so existing unfenced callers are
+     * unaffected. `hook_created` / `hook_disposed` / `attr_set` are NOT batchable
+     * (the client keeps them on the single-event path) and are rejected here.
+     *
+     * Composition over reimplementation: each op reuses the single-`create`
+     * path. A born-running `step-run` folds create + start into a lazy
+     * `step_started` carrying the creation `input` (writes the step entity, a
+     * synthetic `step_created` event, transitions to running, and stamps
+     * `stepCreated` on the create-claim winner). Outcomes, pending creates,
+     * waits, hook_received, and the terminal run event are each a single
+     * `create`. Applying in request order keeps eventIds monotonic and preserves
+     * `completed(N) < created(N+1)`. The durable state is BYTE-IDENTICAL to what
+     * the kill-switch (separate-POST) path produces — the strongest guarantee
+     * for a default-on change.
      *
      * Atomicity note (honest for a filesystem World): world-local has no
-     * cross-entity transaction. Causal order `completed(N) < created(N+1)`
-     * (the B2 invariant) is load-bearing and REQUIRES completing N before
-     * creating N+1, so the born-run's create-claim is necessarily acquired
-     * after `completed(N)` is durable — genuine all-or-nothing and causal
-     * ordering can't both hold on a plain FS. We therefore peek first: if
-     * step N+1 is already born-running (idempotent retry / concurrent
-     * double-delivery) we write NOTHING and return current entities without
-     * `stepCreated`. The only non-atomic window left — a second writer
-     * born-running N+1 in the gap after the peek — cannot occur in world-local's
-     * single-process / dev-only model, and even if it did the outcome
-     * (`completed(N)` durable, EntityConflictError surfaced) is identical to the
-     * single-event path's lost-claim behavior, which the client already handles
-     * by reinvoking. The inline delta is deliberately omitted; the client
-     * reloads events when `events` is absent, a cheap local query here.
+     * cross-entity transaction, so a mid-sequence EntityConflictError leaves the
+     * earlier writes durable — not all-or-nothing. This is unreachable in
+     * world-local's single-process / dev-only model (no concurrent writer), and
+     * if it did occur the outcome (some events durable, a lost create-claim
+     * surfaced as EntityConflictError) is recovered by replay exactly like the
+     * single-event path's lost claim, which the client already handles by
+     * reinvoking. v1 idempotency is a pre-apply peek scoped to the triple; the
+     * fenced general path relies on `lastBatchId` (already-applied → no writes)
+     * plus the per-op create-claim. The inline delta is deliberately omitted;
+     * the client reloads events when `events` is absent, a cheap local query.
      */
     async createBatch(runId, batchEvents, params): Promise<BatchEventResult> {
       if (!runId) {
@@ -2355,73 +2481,67 @@ export function createEventsStorage(
         }
       }
 
-      const completedReq = batchEvents.find(
-        (e) => e.eventType === 'step_completed'
-      );
-      const createdReq = batchEvents.find(
-        (e) => e.eventType === 'step_created'
-      );
-      const startedReq = batchEvents.find(
-        (e) => e.eventType === 'step_started'
-      );
-      // Only the [step_completed?, step_created, step_started] transition the
-      // runtime batches is supported; anything else is a caller bug.
-      if (
-        !createdReq ||
-        !startedReq ||
-        createdReq.correlationId !== startedReq.correlationId ||
-        batchEvents.some(
-          (e) =>
-            e.eventType !== 'step_completed' &&
-            e.eventType !== 'step_created' &&
-            e.eventType !== 'step_started'
-        )
-      ) {
-        throw new WorkflowWorldError(
-          'world-local: createBatch only supports the [step_completed, step_created, step_started] step transition'
-        );
-      }
-
       // Batch results always resolve their payloads (mirrors world-vercel's
       // createBatch and the single-create default); CreateBatchParams carries no
       // resolveData knob.
       const resolveData = DEFAULT_RESOLVE_DATA_OPTION;
-      const mStepId = createdReq.correlationId as string;
+
+      // Classify the ordered events into positional ops (mirrors
+      // workflow-server's `classifySuspensionBatch`). Each input index maps to
+      // exactly one result position.
+      const ops = classifyLocalSuspensionBatch(batchEvents);
 
       // v2 suspension-batch fence. Present iff the caller supplies a batchId
-      // (the runtime always does for a v2 run); a fence-less caller (direct
-      // tests, legacy) keeps the exact v1 behavior below. The version CAS is a
-      // lock-free read here — genuine cross-transaction atomicity isn't
-      // available on a plain FS (see the atomicity note above); world-local's
-      // single-process/dev model makes the read-modify-advance race unreachable,
-      // and the durable step create-claim remains the hard exactly-once gate.
+      // (the runtime always does for a v2 run). The version CAS is a lock-free
+      // read here — genuine cross-transaction atomicity isn't available on a
+      // plain FS (see the atomicity note above); world-local's single-process
+      // /dev model makes the read-modify-advance race unreachable, and the
+      // per-op create-claim remains the hard exactly-once gate.
       const batchId = params?.batchId;
       const expectedRunVersion = params?.expectedRunVersion;
       const fenced = batchId !== undefined;
 
-      // Materialize the transition's current entities for an idempotent /
-      // already-applied return (no writes, no stepCreated).
-      const currentTransitionResults = async (): Promise<EventResult[]> => {
-        const out: EventResult[] = [];
-        if (completedReq) {
-          const nStep = await readJSONWithFallback(
-            basedir,
-            'steps',
-            `${runId}-${completedReq.correlationId}`,
-            StepSchema,
-            tag
-          );
-          out.push(nStep ? { step: nStep } : {});
-        }
-        const mStep = await readJSONWithFallback(
-          basedir,
-          'steps',
-          `${runId}-${mStepId}`,
-          StepSchema,
-          tag
+      // The unfenced (legacy / direct-test) path keeps the v1 triple-only
+      // contract: a leading outcome? plus exactly one born-running step-run.
+      // The full suspension grammar is admitted only on the fenced v2 path.
+      const stepRunOps = ops.filter(
+        (o): o is Extract<LocalBatchOp, { kind: 'step-run' }> =>
+          o.kind === 'step-run'
+      );
+      const isV1Triple =
+        stepRunOps.length === 1 &&
+        ops.every((o) => o.kind === 'outcome' || o.kind === 'step-run');
+      if (!fenced && !isV1Triple) {
+        throw new WorkflowWorldError(
+          'world-local: unfenced createBatch supports only the [step_completed?, step_created, step_started] transition; the full suspension grammar requires the v2 fence (batchId)'
         );
-        out.push(mStep ? { step: mStep } : {});
-        out.push(mStep ? { step: mStep } : {});
+      }
+
+      // Positional materialization of the batch's current entities — for an
+      // idempotent / already-applied return (no writes, no `stepCreated`). Only
+      // step entities are read (the client inspects nothing else on this path).
+      const currentResults = async (): Promise<EventResult[]> => {
+        const out: EventResult[] = [];
+        for (const e of batchEvents) {
+          if (
+            typeof e.correlationId === 'string' &&
+            (e.eventType === 'step_created' ||
+              e.eventType === 'step_started' ||
+              e.eventType === 'step_completed' ||
+              e.eventType === 'step_failed')
+          ) {
+            const s = await readJSONWithFallback(
+              basedir,
+              'steps',
+              `${runId}-${e.correlationId}`,
+              StepSchema,
+              tag
+            );
+            out.push(s ? { step: s } : {});
+          } else {
+            out.push({});
+          }
+        }
         return out;
       };
 
@@ -2447,7 +2567,7 @@ export function createEventsStorage(
         // stepCreated; write nothing.
         if (fenceRun.lastBatchId === batchId) {
           return {
-            results: await currentTransitionResults(),
+            results: await currentResults(),
             runVersion: fenceRun.runVersion,
             lastBatchId: batchId,
           };
@@ -2463,57 +2583,86 @@ export function createEventsStorage(
         }
       }
 
-      // Idempotent / already-applied: if step N+1 is already born-running, the
-      // whole transition committed earlier. Write nothing; return the current
-      // entities WITHOUT `stepCreated` so the client re-derives from a fresh
-      // replay instead of double-running the body.
-      const existingM = await readJSONWithFallback(
-        basedir,
-        'steps',
-        `${runId}-${mStepId}`,
-        StepSchema,
-        tag
-      );
-      if (
-        existingM &&
-        (existingM.status === 'running' ||
-          isTerminalStepStatus(existingM.status))
-      ) {
-        const results = await currentTransitionResults();
-        return fenced
-          ? { results, runVersion: fenceRun?.runVersion, lastBatchId: batchId }
-          : { results };
+      // v1 idempotency (triple only): if the lone born-running step already
+      // exists running/terminal, the transition committed earlier. Write
+      // nothing and return current entities WITHOUT `stepCreated` so the client
+      // re-derives from a fresh replay instead of double-running the body. The
+      // fenced general path relies on `lastBatchId` (above) + the per-op
+      // create-claim instead, so this peek is scoped to the triple.
+      if (isV1Triple) {
+        const existingM = await readJSONWithFallback(
+          basedir,
+          'steps',
+          `${runId}-${stepRunOps[0].created.correlationId}`,
+          StepSchema,
+          tag
+        );
+        if (
+          existingM &&
+          (existingM.status === 'running' ||
+            isTerminalStepStatus(existingM.status))
+        ) {
+          const results = await currentResults();
+          return fenced
+            ? {
+                results,
+                runVersion: fenceRun?.runVersion,
+                lastBatchId: batchId,
+              }
+            : { results };
+        }
       }
 
-      // 1. Complete step N first — preserves causal order completed(N) < the
-      //    N+1 create below.
-      let completedResult: EventResult | undefined;
-      if (completedReq) {
-        completedResult = await eventsStore.create(runId, completedReq, {
-          resolveData,
-        });
+      // Apply every op in request order, building one result per input event
+      // position. Ordering is load-bearing: the leading outcome (index 0) is
+      // applied first so `completed(N) < created(N+1)` holds, and eventIds are
+      // minted in request order.
+      const results: EventResult[] = new Array(batchEvents.length);
+      for (const op of ops) {
+        switch (op.kind) {
+          case 'outcome':
+          case 'step-pending':
+          case 'wait':
+          case 'hook-received':
+          case 'terminal': {
+            // A single create per op. `step-pending` carries no `stepCreated`
+            // on its result (the server stamps it only on a born-running
+            // started frame); a lost claim throws EntityConflictError.
+            results[op.index] = await eventsStore.create(runId, op.req, {
+              resolveData,
+            });
+            break;
+          }
+          case 'step-run': {
+            // Born-run by folding create + start into a lazy step_started that
+            // carries the creation input — reuses the single-path born-running
+            // write (step entity + synthetic step_created + running + the
+            // `stepCreated` create-claim stamp). A lost claim throws
+            // EntityConflictError (→ client reinvokes), matching the server's
+            // all-or-nothing 409 step-claim-lost.
+            const lazyStarted = {
+              ...op.started,
+              eventData: {
+                ...(op.started.eventData as Record<string, unknown>),
+                input: (op.created.eventData as { input: unknown }).input,
+              },
+            } as CreateEventRequest;
+            const startedResult = await eventsStore.create(runId, lazyStarted, {
+              resolveData,
+            });
+            // The created-frame result is the same entity (client doesn't
+            // inspect it); the started-frame result carries `stepCreated`.
+            results[op.createdIndex] = { step: startedResult.step };
+            results[op.startedIndex] = startedResult;
+            break;
+          }
+        }
       }
 
-      // 2. Born-run step N+1 by folding create + start into a lazy step_started
-      //    that carries the step-creation input. Reuses the single-path
-      //    born-running write sequence and its `stepCreated` create-claim stamp.
-      //    A lost create-claim (concurrent born-run) surfaces as
-      //    EntityConflictError, which the client maps to reinvoke — the same as
-      //    the single-event path.
-      const lazyStarted = {
-        ...startedReq,
-        eventData: {
-          ...(startedReq.eventData as Record<string, unknown>),
-          input: (createdReq.eventData as { input: unknown }).input,
-        },
-      } as CreateEventRequest;
-      const startedResult = await eventsStore.create(runId, lazyStarted, {
-        resolveData,
-      });
-
-      // 3. Advance the fence: bump runVersion to expectedRunVersion + 1 (the
-      //    server's contract) and record lastBatchId, under the run lock so the
-      //    write merges the freshest attributes. v2 only.
+      // Advance the fence: bump runVersion to expectedRunVersion + 1 (the
+      // server's contract) and record lastBatchId, under the run lock so the
+      // write merges the freshest run fields (including a terminal status set by
+      // a run_completed / run_failed op above). v2 only.
       let newRunVersion: number | undefined;
       if (fenced) {
         newRunVersion = (expectedRunVersion as number) + 1;
@@ -2531,16 +2680,6 @@ export function createEventsStorage(
         });
       }
 
-      // 4. One result per input event, in request order. The runtime reads only
-      //    the LAST (started) result — for the born-running step entity and the
-      //    `stepCreated` signal. The created-frame result is synthesized from
-      //    the same entity (the client does not inspect it).
-      const results: EventResult[] = [];
-      if (completedResult) {
-        results.push(completedResult);
-      }
-      results.push({ step: startedResult.step });
-      results.push(startedResult);
       return fenced
         ? { results, runVersion: newRunVersion, lastBatchId: batchId }
         : { results };
