@@ -1732,10 +1732,25 @@ export function workflowEntrypoint(
                         // invocation, not turbo (turbo forces optimistic start,
                         // which is incompatible with the durable await-then-run
                         // batch), and a clean single-inline-step transition with
-                        // no hooks/waits — the v1 batch combinations. Judged here
-                        // from the suspension counts + the cumulative
-                        // open-hook/wait state, all known before handleSuspension
-                        // writes anything.
+                        // no hooks/waits/attribute writes — the v1 batch
+                        // combinations. Judged here from the suspension counts +
+                        // the cumulative open-hook/wait state, all known before
+                        // handleSuspension writes anything.
+                        //
+                        // attributeCount === 0 is load-bearing, not cosmetic: the
+                        // batch endpoint commits only [completed(N), created(N+1),
+                        // started(N+1)] and never carries an attr_set, so a step
+                        // co-suspended with an attribute write can't be batched
+                        // regardless. Excluding it here routes such a suspension to
+                        // the flush below, which makes completed(N) durable via the
+                        // single path BEFORE handleSuspension writes attr_set —
+                        // preserving the causal order completed(N) < attr_set that
+                        // the single-write path always produces. Leaving it in the
+                        // candidate would skip the flush (batchTransitionCandidate
+                        // ignores attributes), and the hasAttributeEvents replay
+                        // continue further down re-derives the same attr_set every
+                        // iteration without ever committing the deferred completion
+                        // → livelock → replay-budget run_failed.
                         const batchOpenState =
                           openHookAndWaitState(cachedEvents);
                         const batchTransitionCandidate =
@@ -1747,6 +1762,7 @@ export function workflowEntrypoint(
                           err.stepCount === 1 &&
                           err.hookCount === 0 &&
                           err.waitCount === 0 &&
+                          err.attributeCount === 0 &&
                           !batchOpenState.openHook &&
                           !batchOpenState.openWait;
 
