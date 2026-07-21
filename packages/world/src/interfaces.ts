@@ -4,6 +4,8 @@ import type {
   ExperimentalSetAttributesResult,
 } from './attributes.js';
 import type {
+  BatchEventResult,
+  CreateBatchParams,
   CreateEventParams,
   CreateEventRequest,
   Event,
@@ -270,6 +272,40 @@ export interface Storage {
       data: CreateEventRequest,
       params?: CreateEventParams
     ): Promise<EventResult>;
+
+    /**
+     * Create an ordered batch of events for an existing run in a single
+     * atomic, all-or-nothing write, returning one {@link EventResult} per
+     * event in request order.
+     *
+     * OPTIONAL capability. Worlds that omit it are fully supported: the core
+     * runtime detects its absence (`typeof events.createBatch !== 'function'`)
+     * and falls back to separate `create` calls. The Vercel World implements it
+     * against a batch endpoint so a step transition (complete step N, then
+     * create & start step N+1) commits in ONE round-trip instead of two — see
+     * the `WORKFLOW_BATCH_TRANSITIONS` runtime flag. `world-local` and
+     * `world-postgres` don't implement it and behave exactly as today.
+     *
+     * Semantics the runtime relies on:
+     * - `events` is ordered and non-empty; the batch applies them in order.
+     * - All-or-nothing: a conditional failure on any event (a lost
+     *   `step_started` create-claim, or a `step_completed`/`step_created`
+     *   against an already-advanced run) rejects the WHOLE batch with
+     *   `EntityConflictError` and writes nothing.
+     * - Idempotent-on-retry: retrying a batch that already applied resolves
+     *   successfully with the current entities, so transport failures are safe
+     *   to retry end-to-end.
+     *
+     * @param runId - The run ID (required; batches never include `run_created`).
+     * @param events - Ordered events to apply atomically (never `run_created`).
+     * @param params - Optional batch parameters.
+     * @returns Per-event results plus an optional inline delta.
+     */
+    createBatch?(
+      runId: string,
+      events: CreateEventRequest[],
+      params?: CreateBatchParams
+    ): Promise<BatchEventResult>;
 
     get(
       runId: string,

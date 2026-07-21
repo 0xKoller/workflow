@@ -9,6 +9,7 @@ import {
   type RunErrorCode,
   RunExpiredError,
   WorkflowRuntimeError,
+  WorkflowWorldError,
 } from '@workflow/errors';
 import { setWorkflowBasePath } from '@workflow/utils';
 import {
@@ -16,6 +17,7 @@ import {
   workflowDisplayName,
 } from '@workflow/utils/parse-name';
 import {
+  type CreateEventRequest,
   type Event,
   getQueueTopicPrefix,
   isLegacySpecVersion,
@@ -23,6 +25,7 @@ import {
   resolveQueueNamespace,
   SPEC_VERSION_CURRENT,
   SPEC_VERSION_SUPPORTS_COMPRESSION,
+  type Step,
   WorkflowInvokePayloadSchema,
   type WorkflowRun,
   type World,
@@ -39,6 +42,7 @@ import { ReplayPayloadCache } from './replay-payload-cache.js';
 import {
   getMaxQueueDeliveries,
   getReplayDivergenceMaxRetries,
+  isBatchTransitionsEnabled,
   isInlineOwnershipEnabled,
   isTurboEnabled,
 } from './runtime/constants.js';
@@ -547,6 +551,39 @@ export function workflowEntrypoint(
                     events: Event[];
                     cursor: string | null;
                   } | null = null;
+
+                  // Batch step transitions (WORKFLOW_BATCH_TRANSITIONS). When
+                  // an inline step completes and the next suspension yields
+                  // exactly one inline step, its `step_completed` write is
+                  // deferred so it can be committed atomically — in one batch
+                  // POST — with that next step's create + start. Between the two
+                  // loop iterations the deferred completion is held here: the
+                  // real request (sent in the batch) plus a locally synthesized
+                  // completed event that seeds the NEXT replay past the
+                  // not-yet-durable completion (cachedEvents stays authoritative
+                  // and never holds the synthetic; the batch makes the real
+                  // event durable and merges it in). Null when no completion is
+                  // deferred. See consumeBatchTransition / the produce sites
+                  // around the inline execution.
+                  let pendingBatchTransition: {
+                    stepId: string;
+                    completedRequest: CreateEventRequest;
+                    syntheticCompleted: Event;
+                    // Cursor as of before this completion was due — the
+                    // sinceCursor handed to the batch so it can return the
+                    // event-log delta the same way a single step_completed does.
+                    sinceCursor: string | null;
+                  } | null = null;
+                  // Latch: once the server 404/405s the batch endpoint (older
+                  // deployment without it), stop attempting batches for the rest
+                  // of this invocation and fall back to the separate awaited
+                  // POSTs. Reset per invocation (a fresh delivery re-probes).
+                  let batchTransitionsDisabled = false;
+                  // How many steps this invocation has executed inline. The
+                  // first inline step stays on the existing path (its completion
+                  // is written immediately, not deferred) — scope control — so
+                  // batching only begins deferring from the second step onward.
+                  let inlineStepsExecuted = 0;
 
                   // Shared state: set by either the background step path
                   // or the run_started setup below.
@@ -1137,6 +1174,67 @@ export function workflowEntrypoint(
                     encryptionKey
                   );
 
+                  // Batch transitions: build the locally synthesized
+                  // `step_completed` that seeds a replay past a deferred (not
+                  // yet durable) completion. The step consumer resolves a step
+                  // purely from its `step_completed` event (see step.ts), so a
+                  // synthetic completion carrying the real result bytes lets the
+                  // workflow advance to the next step; the batch then makes the
+                  // real, byte-equivalent event durable. The synthetic event is
+                  // never merged into `cachedEvents` (a fake eventId that would
+                  // never dedupe against the real one) — it lives only in the
+                  // throwaway replay array.
+                  const buildSyntheticCompleted = (
+                    request: CreateEventRequest
+                  ): Event =>
+                    ({
+                      ...request,
+                      runId,
+                      eventId: `evnt_synthetic_${request.correlationId ?? 'step'}`,
+                      createdAt: new Date(),
+                    }) as Event;
+
+                  // Batch transitions: flush a deferred completion via the
+                  // single-event path when the transition can't be batched
+                  // (next suspension isn't a lone inline step, run completion,
+                  // batching disabled, etc.). Clears the pending state; the
+                  // caller then re-replays from the now-durable completion.
+                  // Returns 'stale' on a 412 (the caller re-invokes for a fresh
+                  // replay); a 409/410 means the run advanced elsewhere so the
+                  // completion already exists ('ok'). Transient errors propagate
+                  // for queue redelivery.
+                  const flushDeferredBatchCompletion = async (): Promise<
+                    'ok' | 'stale'
+                  > => {
+                    const pending = pendingBatchTransition;
+                    if (!pending) return 'ok';
+                    pendingBatchTransition = null;
+                    try {
+                      await world.events.create(
+                        runId,
+                        pending.completedRequest,
+                        {
+                          requestId,
+                          stateUpdatedAt: stateUpdatedAtForCreate(
+                            cachedEvents ?? []
+                          ),
+                        }
+                      );
+                      return 'ok';
+                    } catch (err) {
+                      if (
+                        EntityConflictError.is(err) ||
+                        RunExpiredError.is(err)
+                      ) {
+                        // Run advanced elsewhere — the completion is already
+                        // durable; the reload below observes it.
+                        return 'ok';
+                      }
+                      if (PreconditionFailedError.is(err)) return 'stale';
+                      throw err;
+                    }
+                  };
+
                   // Main replay loop
                   // biome-ignore lint/correctness/noConstantCondition: intentional loop
                   while (true) {
@@ -1198,7 +1296,24 @@ export function workflowEntrypoint(
                       // The server always returns a cursor when there are events (even on the
                       // final page), so we can reliably use it for incremental loading.
                       let events: Event[];
-                      if (pendingInlineDelta && cachedEvents) {
+                      if (pendingBatchTransition && cachedEvents) {
+                        // Batch transition: the previous iteration deferred step
+                        // N's completion so it can be committed atomically with
+                        // the next step's create + start. That completion is not
+                        // durable yet, so append its locally synthesized copy to
+                        // THIS replay's event view only — enough for the workflow
+                        // to advance past step N and reach step N+1 — while
+                        // cachedEvents stays authoritative (no synthetic). The
+                        // batch issued below makes the real completed(N) durable
+                        // and merges it into cachedEvents; if we cannot batch,
+                        // the deferred completion is flushed as a normal write
+                        // before any dependent event. eventsCursor is NOT
+                        // advanced here (the synthetic has no server position).
+                        events = [
+                          ...cachedEvents,
+                          pendingBatchTransition.syntheticCompleted,
+                        ];
+                      } else if (pendingInlineDelta && cachedEvents) {
                         // Fast path: the previous iteration's inline step
                         // terminal write returned the authoritative event-log
                         // delta since the pre-write cursor, so we consume it
@@ -1422,8 +1537,15 @@ export function workflowEntrypoint(
                         return;
                       }
 
-                      // Update cache reference (may have been set for first time)
-                      cachedEvents = events;
+                      // Update cache reference (may have been set for first
+                      // time). Skip while a batch transition is pending: `events`
+                      // carries the synthesized (not-yet-durable) completion, and
+                      // cachedEvents must stay authoritative — the batch merges
+                      // the real events in, or the deferred completion is flushed
+                      // and reloaded before continuing.
+                      if (!pendingBatchTransition) {
+                        cachedEvents = events;
+                      }
 
                       // Latency telemetry: judge TTFS eligibility against the
                       // invocation's first snapshot. Waits completed above
@@ -1483,6 +1605,18 @@ export function workflowEntrypoint(
                         loopIteration,
                         replayMs: Date.now() - replayStart,
                       });
+
+                      // Batch transitions: the workflow completed with a prior
+                      // step's completion still deferred (this was the final
+                      // step). Its `step_completed` and the terminal
+                      // `run_completed` stay on the existing path — flush the
+                      // completion now, then re-replay so `run_completed` is
+                      // written from the authoritative log exactly as today.
+                      if (pendingBatchTransition) {
+                        const flushed = await flushDeferredBatchCompletion();
+                        if (flushed === 'stale') return await reinvoke(0);
+                        continue;
+                      }
 
                       // Workflow completed. Send the snapshot but do NOT
                       // reload-and-retry the create in place: `result` was
@@ -1590,6 +1724,49 @@ export function workflowEntrypoint(
                             'Invariant violation: workflow suspended before its event log was loaded'
                           );
                         }
+
+                        // Batch transitions: can a completion deferred by the
+                        // previous inline step be committed atomically with THIS
+                        // suspension's step scheduling? Requires the flag, a
+                        // batch-capable World, batching still enabled this
+                        // invocation, not turbo (turbo forces optimistic start,
+                        // which is incompatible with the durable await-then-run
+                        // batch), and a clean single-inline-step transition with
+                        // no hooks/waits — the v1 batch combinations. Judged here
+                        // from the suspension counts + the cumulative
+                        // open-hook/wait state, all known before handleSuspension
+                        // writes anything.
+                        const batchOpenState =
+                          openHookAndWaitState(cachedEvents);
+                        const batchTransitionCandidate =
+                          pendingBatchTransition !== null &&
+                          isBatchTransitionsEnabled() &&
+                          typeof world.events.createBatch === 'function' &&
+                          !batchTransitionsDisabled &&
+                          !turbo &&
+                          err.stepCount === 1 &&
+                          err.hookCount === 0 &&
+                          err.waitCount === 0 &&
+                          !batchOpenState.openHook &&
+                          !batchOpenState.openWait;
+
+                        // A completion is deferred but this transition cannot be
+                        // batched (the run moved to parallel steps, a hook/wait,
+                        // run completion is handled above, or batching is
+                        // unavailable). Flush it via the single path BEFORE
+                        // handleSuspension writes any dependent event — the
+                        // journal must keep completed(N) ahead of the next
+                        // suspension's writes — then re-replay from the durable
+                        // state and handle this suspension normally.
+                        if (
+                          pendingBatchTransition &&
+                          !batchTransitionCandidate
+                        ) {
+                          const flushed = await flushDeferredBatchCompletion();
+                          if (flushed === 'stale') return await reinvoke(0);
+                          continue;
+                        }
+
                         const suspensionLog: MutableEventLog = {
                           events: cachedEvents,
                           cursor: eventsCursor,
@@ -1994,6 +2171,33 @@ export function workflowEntrypoint(
                           );
                         }
 
+                        // Batch transition (WORKFLOW_BATCH_TRANSITIONS):
+                        // re-validate the deferred-completion batch against the
+                        // realized post-handleSuspension shape. The
+                        // suspension-entry gate (`batchTransitionCandidate`) is
+                        // judged from the suspension counts before
+                        // handleSuspension runs; confirm here that it produced
+                        // exactly the clean single lazy-inline step we can fold
+                        // the deferred completion into. Always false when no
+                        // completion is pending, so the default path is inert.
+                        const batchTransitionActive =
+                          batchTransitionCandidate &&
+                          inlineExecutions.length === 1 &&
+                          lazyInlineSteps.length === 1 &&
+                          ownedRecoverySteps.length === 0;
+
+                        // Defensive: a completion was deferred and admitted by
+                        // the suspension-entry gate, but the realized suspension
+                        // isn't the clean single lazy-inline step we batch
+                        // (unreachable in normal operation — a deferred
+                        // completion implies the next step is fresh + inline).
+                        // Never drop it: flush the completion durably, then
+                        // re-derive from a fresh replay.
+                        if (pendingBatchTransition && !batchTransitionActive) {
+                          await flushDeferredBatchCompletion();
+                          return await reinvoke(0);
+                        }
+
                         // Nothing to execute inline — everything has been
                         // queued (or no work needs scheduling). Exit and let
                         // the queue drive subsequent replays.
@@ -2022,6 +2226,33 @@ export function workflowEntrypoint(
                         const openHookWaitState = openHookAndWaitState(
                           cachedEvents ?? []
                         );
+
+                        // Batch transition (WORKFLOW_BATCH_TRANSITIONS): may
+                        // THIS step's terminal `step_completed` be deferred so
+                        // the NEXT transition folds it into one batch POST with
+                        // the following step's create + start? Same clean
+                        // single-lazy-inline-step shape as the batch consume,
+                        // and only from the SECOND inline step of an invocation
+                        // onward (`inlineStepsExecuted >= 1`): the first step
+                        // stays on the existing single-write path so its TTFS
+                        // telemetry and start latency are measured exactly as
+                        // today. A step started by a batch (`batchTransitionActive`)
+                        // is already past the first, so it always chains. Always
+                        // false when the flag is off or the World lacks
+                        // `createBatch`, so the default path never defers.
+                        const eligibleToDefer =
+                          isBatchTransitionsEnabled() &&
+                          typeof world.events.createBatch === 'function' &&
+                          !batchTransitionsDisabled &&
+                          !turbo &&
+                          inlineExecutions.length === 1 &&
+                          lazyInlineSteps.length === 1 &&
+                          ownedRecoverySteps.length === 0 &&
+                          err.hookCount === 0 &&
+                          err.waitCount === 0 &&
+                          !openHookWaitState.openHook &&
+                          !openHookWaitState.openWait &&
+                          (batchTransitionActive || inlineStepsExecuted >= 1);
 
                         // Inline-delta fast path gate. We request the delta —
                         // and on the next iteration consume it in place of the
@@ -2221,6 +2452,163 @@ export function workflowEntrypoint(
                         const inlineClaimStateUpdatedAt =
                           stateUpdatedAtForCreate(cachedEvents ?? []);
 
+                        // Batch transition (WORKFLOW_BATCH_TRANSITIONS): commit
+                        // the deferred completion of step N together with step
+                        // N+1's create + start in ONE POST, replacing the two
+                        // serialized round-trips (step_completed(N), then a
+                        // folded lazy step_started(N+1)). The batch is durable
+                        // and all-or-nothing: step N+1's body runs only AFTER it
+                        // returns (this is NOT optimistic start). On success the
+                        // batch response seeds N+1's entity (`batchPreStartedStep`)
+                        // and carries the same inline-delta a single
+                        // step_completed would, which we merge into cachedEvents
+                        // so the chained defer below (and the next replay) see
+                        // the whole transition as durable.
+                        let batchPreStartedStep: Step | undefined;
+                        if (batchTransitionActive && pendingBatchTransition) {
+                          const pending = pendingBatchTransition;
+                          const only = inlineExecutions[0];
+                          const batchEvents: CreateEventRequest[] = [
+                            // step_completed(N) — the deferred terminal write,
+                            // carrying its result bytes + latency telemetry.
+                            pending.completedRequest,
+                            // step_created(N+1) — explicit (the batch does not
+                            // fold create into start the way the lazy single
+                            // POST does; the server folds create + start into a
+                            // born-running entity itself).
+                            {
+                              eventType: 'step_created',
+                              specVersion: SPEC_VERSION_CURRENT,
+                              correlationId: only.correlationId,
+                              eventData: {
+                                stepName: only.stepName,
+                                workflowName,
+                                input: only.lazyStepInput,
+                              },
+                            },
+                            // step_started(N+1) — the claim; server strips input.
+                            {
+                              eventType: 'step_started',
+                              specVersion: SPEC_VERSION_CURRENT,
+                              correlationId: only.correlationId,
+                              eventData: {
+                                stepName: only.stepName,
+                                workflowName,
+                                // Inline-ownership stamp — same as the lazy
+                                // step_started path (see executeStep).
+                                ...(metadata.messageId !== undefined
+                                  ? { ownerMessageId: metadata.messageId }
+                                  : {}),
+                              },
+                            },
+                          ];
+                          try {
+                            // biome-ignore lint/style/noNonNullAssertion: batchTransitionActive implies createBatch is a function
+                            const batchResult = await world.events.createBatch!(
+                              runId,
+                              batchEvents,
+                              {
+                                requestId,
+                                ...(pending.sinceCursor
+                                  ? { sinceCursor: pending.sinceCursor }
+                                  : {}),
+                                ...(inlineClaimStateUpdatedAt !== undefined
+                                  ? {
+                                      stateUpdatedAt: inlineClaimStateUpdatedAt,
+                                    }
+                                  : {}),
+                              }
+                            );
+                            pendingBatchTransition = null;
+                            // Seed step N+1 from the step_started result (the
+                            // last frame), which carries the born-running entity
+                            // and stepCreated.
+                            const startedResult =
+                              batchResult.results[
+                                batchResult.results.length - 1
+                              ];
+                            batchPreStartedStep = startedResult?.step;
+                            if (!batchPreStartedStep) {
+                              throw new WorkflowRuntimeError(
+                                `batch step transition for "${only.correlationId}" returned no started step entity`
+                              );
+                            }
+                            // Make completed(N) + created/started(N+1) durable in
+                            // the local view. The batch's eventsDelta is
+                            // byte-for-byte what events.list(sinceCursor) would
+                            // return post-commit; merge it (dedupe by eventId)
+                            // and advance the cursor exactly like the
+                            // pendingInlineDelta fast path.
+                            if (batchResult.events) {
+                              if (
+                                batchResult.events.length > 0 &&
+                                cachedEvents
+                              ) {
+                                const existingIds = new Set(
+                                  cachedEvents.map((e) => e.eventId)
+                                );
+                                for (const e of batchResult.events) {
+                                  if (!existingIds.has(e.eventId)) {
+                                    existingIds.add(e.eventId);
+                                    cachedEvents.push(e);
+                                  }
+                                }
+                              }
+                              eventsCursor = batchResult.cursor ?? eventsCursor;
+                            } else {
+                              // Batch-capable but older server that omits the
+                              // delta: reload so cachedEvents reflects the
+                              // committed transition before we chain.
+                              const loaded = await loadWorkflowRunEvents(runId);
+                              cachedEvents = loaded.events;
+                              eventsCursor = loaded.cursor;
+                            }
+                          } catch (batchErr) {
+                            // Endpoint absent on an older server (404/405):
+                            // disable batching for the rest of this invocation.
+                            // Nothing was written, so the deferred completion is
+                            // still pending — flush it, then re-derive from a
+                            // fresh replay that runs step N+1 on the single path.
+                            if (
+                              WorkflowWorldError.is(batchErr) &&
+                              (batchErr.status === 404 ||
+                                batchErr.status === 405)
+                            ) {
+                              batchTransitionsDisabled = true;
+                              await flushDeferredBatchCompletion();
+                              return await reinvoke(0);
+                            }
+                            // Stale snapshot (412): the loaded view is behind an
+                            // out-of-band event. Nothing written — abandon the
+                            // deferred completion and re-invoke for a fresh
+                            // replay that observes the new event.
+                            if (PreconditionFailedError.is(batchErr)) {
+                              pendingBatchTransition = null;
+                              return await reinvoke(0);
+                            }
+                            // All-or-nothing conflict (409) or run-not-running
+                            // (410): the run advanced elsewhere or the claim was
+                            // lost — nothing written. Abandon the deferred
+                            // completion and re-derive from a fresh replay of the
+                            // durable log (which observes whatever truly
+                            // happened and proceeds, mapping a lost step to the
+                            // existing skipped/terminal handling).
+                            if (
+                              EntityConflictError.is(batchErr) ||
+                              RunExpiredError.is(batchErr)
+                            ) {
+                              pendingBatchTransition = null;
+                              return await reinvoke(0);
+                            }
+                            // Transient transport failure (withBatchPostRetry
+                            // exhausted its in-process budget): rethrow for queue
+                            // redelivery. The batch is idempotent end-to-end — a
+                            // fully-applied batch replays to 200 — so retrying
+                            // the whole transition is safe.
+                            throw batchErr;
+                          }
+                        }
+
                         replayBudget.pause();
                         let stepResults: Awaited<
                           ReturnType<typeof executeStep>
@@ -2266,12 +2654,36 @@ export function workflowEntrypoint(
                                 suppressOptimisticStart,
                                 runReadyBarrier,
                                 stateUpdatedAt: inlineClaimStateUpdatedAt,
+                                // Batch transition: this step's step_started was
+                                // already committed by the batch above, so run
+                                // the body against that entity — no start POST,
+                                // no create-claim to lose. Mutually exclusive
+                                // with lazyStepInput's optimistic/lazy start.
+                                ...(batchTransitionActive && batchPreStartedStep
+                                  ? { preStarted: batchPreStartedStep }
+                                  : {}),
+                                // Batch transition: defer this step's terminal
+                                // step_completed so the next transition folds it
+                                // into one batch POST. No inline delta is
+                                // requested on a deferred write (nothing is
+                                // written here), so it is mutually exclusive
+                                // with inlineDeltaSinceCursor below.
+                                ...(eligibleToDefer
+                                  ? { deferTerminalWrite: true }
+                                  : {}),
+                                // Latency tracking is measured only for the
+                                // first, non-batched step of an invocation — a
+                                // batched step issues no start POST, so RSFS/TTFS
+                                // don't apply.
                                 ...(stepIndex === 0 &&
                                 s.lazyStepInput !== undefined &&
-                                latencyTracking
+                                latencyTracking &&
+                                !batchTransitionActive
                                   ? { latencyTracking }
                                   : {}),
-                                ...(requestInlineDelta && preInlineWriteCursor
+                                ...(requestInlineDelta &&
+                                preInlineWriteCursor &&
+                                !eligibleToDefer
                                   ? {
                                       inlineDeltaSinceCursor:
                                         preInlineWriteCursor,
@@ -2329,6 +2741,43 @@ export function workflowEntrypoint(
                           throw stepErr;
                         } finally {
                           replayBudget.resume();
+                        }
+
+                        // Batch transition (WORKFLOW_BATCH_TRANSITIONS): a lone
+                        // inline step whose terminal write we deferred. Its
+                        // step_completed was NOT written by executeStep — hold it
+                        // for the NEXT transition's batch (with that step's
+                        // create + start). Tracked per-invocation so the first
+                        // inline step is never deferred (see eligibleToDefer).
+                        if (
+                          inlineExecutions.length === 1 &&
+                          stepResults[0].type === 'completed'
+                        ) {
+                          inlineStepsExecuted++;
+                          const only = stepResults[0];
+                          if (only.deferredCompletion) {
+                            pendingBatchTransition = {
+                              stepId: inlineExecutions[0].correlationId,
+                              completedRequest: only.deferredCompletion.request,
+                              syntheticCompleted: buildSyntheticCompleted(
+                                only.deferredCompletion.request
+                              ),
+                              // sinceCursor for the deferred completion's batch:
+                              // the log position as of now (after this step's
+                              // start), so the batch's eventsDelta covers exactly
+                              // completed(N) + created/started(N+1).
+                              sinceCursor: eventsCursor,
+                            };
+                            // A deferred step with unflushed background ops is
+                            // about to break the loop and re-invoke to flush
+                            // them; the deferral is invocation-local and can't
+                            // survive that, so make completed(N) durable now.
+                            if (only.hasPendingOps) {
+                              const flushed =
+                                await flushDeferredBatchCompletion();
+                              if (flushed === 'stale') return await reinvoke(0);
+                            }
+                          }
                         }
 
                         // Aggregate the batch results. `retry` steps (which

@@ -13,7 +13,13 @@ import {
   pluralize,
   stepDisplayName,
 } from '@workflow/utils';
-import type { Event, SerializedData, Step, World } from '@workflow/world';
+import type {
+  CreateEventRequest,
+  Event,
+  SerializedData,
+  Step,
+  World,
+} from '@workflow/world';
 import {
   SPEC_VERSION_CURRENT,
   SPEC_VERSION_SUPPORTS_COMPRESSION,
@@ -180,6 +186,29 @@ export interface StepExecutorParams {
    * runtime/step-latency.ts.
    */
   latencyTracking?: StepLatencyTracking;
+  /**
+   * Batch-transition support (WORKFLOW_BATCH_TRANSITIONS): the step is already
+   * started — its `step_started` was committed atomically by a preceding batch
+   * transition — so skip the `step_started` create entirely and run the body
+   * against this entity (its `attempt`/`startedAt`/`status` come from the batch
+   * response). Mutually exclusive with `lazyStepInput` (a lazy step creates
+   * itself via its own `step_started`). Because the batch already claimed the
+   * step, there is no create-claim to lose here and no optimistic start; the
+   * body runs directly. Only the caller that committed the batch (and thus owns
+   * the claim) passes this, preserving exactly-once execution.
+   */
+  preStarted?: Step;
+  /**
+   * Batch-transition support (WORKFLOW_BATCH_TRANSITIONS): defer this step's
+   * terminal `step_completed` write so the caller can commit it atomically —
+   * in one batch POST — with the NEXT step's create + start. On the successful
+   * completed path executeStep does NOT write `step_completed`; it returns the
+   * fully-formed request on `deferredCompletion` for the caller to include in
+   * its batch. Only the happy completed path is deferred: `step_failed` /
+   * `step_retrying` (rare, and not the optimization's target) are written
+   * inline exactly as today. Ignored on any non-completed outcome.
+   */
+  deferTerminalWrite?: boolean;
 }
 
 /**
@@ -212,6 +241,15 @@ export type StepExecutionResult =
       type: 'completed';
       hasPendingOps?: boolean;
       inlineDelta?: InlineEventDelta;
+      /**
+       * Batch-transition support: present when the caller passed
+       * {@link StepExecutorParams.deferTerminalWrite}. The step body ran to
+       * completion but its `step_completed` was NOT written — the caller must
+       * commit `request` (atomically, in a batch with the next step's create +
+       * start). Mutually exclusive with `inlineDelta` (no write happened, so
+       * there is no delta to return).
+       */
+      deferredCompletion?: { request: CreateEventRequest };
     }
   | { type: 'failed' }
   | { type: 'retry'; timeoutSeconds: number }
@@ -416,6 +454,7 @@ export async function executeStep(
     // confirmed, which is exactly the property an operator opts out of with that
     // flag, so an explicit opt-out wins over turbo's force.
     const optimisticStart =
+      params.preStarted === undefined &&
       params.lazyStepInput !== undefined &&
       // Stale-sensitive guarded batches await the claim so the 412 fence
       // covers the body, not just durable writes — see
@@ -453,7 +492,17 @@ export async function executeStep(
       return mapped;
     };
 
-    if (optimisticStart) {
+    if (params.preStarted) {
+      // Batch transition: the step's `step_started` was already committed
+      // atomically by the caller's batch (complete step N + create & start this
+      // step N+1). The claim is ours (only the batch's committer runs this
+      // path), so there is no create-claim to make or lose here — run the body
+      // directly against the entity the batch returned. No step_started POST is
+      // issued, so `stepStartPostSentAtMs` stays undefined and RSFS is not
+      // measured for a batched step (latency is only tracked for the first,
+      // non-batched, step of an invocation).
+      step = params.preStarted;
+    } else if (optimisticStart) {
       // Chain the lazy `step_started` on the run-ready barrier (turbo mode):
       // the step can't be created before its run exists, but the body below
       // runs immediately against synthesized state, so the `run_started`
@@ -1171,6 +1220,36 @@ export async function executeStep(
       return { type: 'retry', timeoutSeconds };
     }
 
+    // Assemble the step_completed request once — written inline below, or
+    // handed back for the caller to commit in a batch transition.
+    const completedRequest: CreateEventRequest = {
+      eventType: 'step_completed',
+      specVersion: SPEC_VERSION_CURRENT,
+      correlationId: stepId,
+      eventData: {
+        stepName,
+        workflowName,
+        result: result as Uint8Array,
+        ...latencyEventData,
+      },
+    };
+
+    // Batch transition: defer the terminal write. The body ran to completion,
+    // but its `step_completed` is committed by the caller — atomically, in one
+    // batch with the next step's create + start — instead of here. No write
+    // happens on this path, so there is no inline delta to return.
+    if (params.deferTerminalWrite) {
+      span?.setAttributes({
+        ...Attribute.StepStatus('completed'),
+        ...Attribute.StepResultType(typeof result),
+      });
+      return {
+        type: 'completed',
+        hasPendingOps: !opsSettled,
+        deferredCompletion: { request: completedRequest },
+      };
+    }
+
     // Create step_completed event outside the step execution failure path:
     // persistence failures are infrastructure errors and should redeliver the
     // queue message, not become user step_retrying/step_failed events.
@@ -1178,17 +1257,7 @@ export async function executeStep(
     try {
       completedResult = await world.events.create(
         workflowRunId,
-        {
-          eventType: 'step_completed',
-          specVersion: SPEC_VERSION_CURRENT,
-          correlationId: stepId,
-          eventData: {
-            stepName,
-            workflowName,
-            result: result as Uint8Array,
-            ...latencyEventData,
-          },
-        },
+        completedRequest,
         params.inlineDeltaSinceCursor !== undefined
           ? { sinceCursor: params.inlineDeltaSinceCursor }
           : undefined

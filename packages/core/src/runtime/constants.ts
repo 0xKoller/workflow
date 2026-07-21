@@ -276,6 +276,30 @@ export function isTurboEnabled(): boolean {
 }
 
 /**
+ * Whether durable batch step transitions are enabled (default OFF). When on
+ * AND the World implements `events.createBatch`, the sequential inline path
+ * collapses a step transition — completing step N and creating + starting the
+ * lone next inline step N+1 — into a single atomic batch POST, instead of the
+ * two serialized round-trips (step_completed then step_started) it does today.
+ *
+ * This is NOT optimistic start: step N+1's body still runs only after its claim
+ * and start are durable. The latency win comes purely from collapsing two RTTs
+ * into one; the create-claim now commits atomically with the previous
+ * completion (strictly fewer intermediate crash states). Off by default and
+ * gated independently of the other inline optimizations — a World that lacks
+ * `createBatch`, or a server without the batch endpoint, transparently falls
+ * back to today's separate awaited POSTs.
+ *
+ * Reads `process.env.WORKFLOW_BATCH_TRANSITIONS` lazily. Enabled only by an
+ * explicit `'1'` / `'true'` (case-insensitive).
+ */
+export function isBatchTransitionsEnabled(): boolean {
+  const raw = process.env.WORKFLOW_BATCH_TRANSITIONS;
+  if (raw === undefined || raw === '') return false;
+  return raw === '1' || raw.toLowerCase() === 'true';
+}
+
+/**
  * Whether inline step ownership is enabled (default ON). When on, the lazy
  * `step_started` that creates an inline step records the owning queue
  * message ID, and wake replays that observe an actively-owned step enqueue a

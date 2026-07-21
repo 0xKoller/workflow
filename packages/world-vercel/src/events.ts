@@ -35,7 +35,10 @@
 import { HookNotFoundError, WorkflowWorldError } from '@workflow/errors';
 import {
   type AnyEventRequest,
+  type BatchEventResult,
+  type CreateBatchParams,
   type CreateEventParams,
+  type CreateEventRequest,
   type Event,
   type EventDataPayloadField,
   type EventResult,
@@ -47,14 +50,18 @@ import {
   type ListEventsByCorrelationIdParams,
   type ListEventsParams,
   type PaginatedResponse,
+  type ResolveData,
   StructuredErrorSchema,
   stripEventDataRefs,
   validateUlidTimestamp,
   type WorkflowRun,
 } from '@workflow/world';
 import { decode } from 'cbor-x';
-import { withEventPostRetry } from './event-retry.js';
+import { withBatchPostRetry, withEventPostRetry } from './event-retry.js';
 import {
+  type BatchEventV4Input,
+  type CreateEventV4Result,
+  createWorkflowRunEventsBatchV4,
   createWorkflowRunEventV4,
   type DecodedV4Event,
   getEventsByCorrelationIdV4,
@@ -729,7 +736,19 @@ async function createWorkflowRunEventInner(
   // honors the caller's resolveData: 'none' strips payload fields,
   // matching the v3 path's stripEventAndLegacyRefs behavior.
   const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
-  const body = result.body;
+  return bagToEventResult(result.body, resolveData);
+}
+
+/**
+ * Map a v4 materialized-entity bag (the CBOR `body` a create/batch response
+ * returns per event) into an {@link EventResult}. Shared by the single-create
+ * return path and the batch adapter so both apply identical date coercion,
+ * ref-stripping, and error/step deserialization.
+ */
+function bagToEventResult(
+  body: CreateEventV4Result['body'],
+  resolveData: ResolveData
+): EventResult {
   return {
     event: body.event
       ? stripEventDataRefs(
@@ -754,5 +773,97 @@ async function createWorkflowRunEventInner(
     // signal through so the owned-inline runtime path can gate body execution
     // on it. Absent from older servers → undefined → safe default.
     ...(body.stepCreated ? { stepCreated: true } : {}),
+  };
+}
+
+/**
+ * Build the per-event v4 wire input for one event in a batch — the same
+ * serialization {@link createWorkflowRunEventInner} applies to a single POST
+ * (payload/meta split, remoteRefBehavior, specVersion default). `batchParams`
+ * merges the batch-level fields into the meta of the frame the server reads
+ * them from: `sinceCursor` / `stateUpdatedAt` only on the `step_completed`
+ * frame (the server's "primary"), `vercelId` on every frame — exactly the
+ * single-POST encoding, so each frame is byte-identical to what
+ * {@link createWorkflowRunEventV4} would send for that event alone.
+ */
+function toBatchEventV4Input(
+  runId: string,
+  data: CreateEventRequest,
+  batchParams?: CreateBatchParams
+): BatchEventV4Input {
+  const { payload, meta } = splitEventDataForV4(data);
+  const remoteRefBehavior = eventsNeedingResolve.has(data.eventType)
+    ? 'resolve'
+    : 'lazy';
+  // sinceCursor / stateUpdatedAt ride on the step_completed frame only — the
+  // server reads them off the batch's "primary" (step_completed) frame, and a
+  // create+start-only batch has no completion to guard or diff against.
+  const isCompletion = data.eventType === 'step_completed';
+  return {
+    runId,
+    eventType: data.eventType,
+    specVersion: data.specVersion ?? 2,
+    ...(data.correlationId ? { correlationId: data.correlationId } : {}),
+    ...(batchParams?.requestId ? { vercelId: batchParams.requestId } : {}),
+    ...(isCompletion && batchParams?.sinceCursor
+      ? { sinceCursor: batchParams.sinceCursor }
+      : {}),
+    ...(isCompletion && batchParams?.stateUpdatedAt !== undefined
+      ? { stateUpdatedAt: batchParams.stateUpdatedAt }
+      : {}),
+    occurredAt: new Date(),
+    remoteRefBehavior,
+    payload,
+    ...meta,
+  };
+}
+
+/**
+ * Batch adapter: apply an ordered sequence of events for one run in a single
+ * atomic round-trip (see {@link createWorkflowRunEventsBatchV4} for the wire
+ * contract). Serializes each event exactly like a single create and returns one
+ * {@link EventResult} per event, plus the optional batch-level inline delta.
+ *
+ * The whole batch is idempotent-on-retry (a re-applied batch returns 200 with
+ * current entities), so transient transport failures are retried in-process via
+ * {@link withBatchPostRetry}; a definitive 409 (all-or-nothing conflict), a 410
+ * (run not running), a 412 (stale snapshot), or a 404/405 (endpoint absent on
+ * an older server) surfaces immediately for the runtime to handle.
+ */
+export async function createWorkflowRunEventsBatch(
+  runId: string,
+  events: CreateEventRequest[],
+  params?: CreateBatchParams,
+  config?: APIConfig
+): Promise<BatchEventResult> {
+  if (events.length === 0) {
+    throw new WorkflowWorldError(
+      'world-vercel: createBatch requires at least one event',
+      { status: 400 }
+    );
+  }
+  const result = await withBatchPostRetry(() =>
+    createWorkflowRunEventsBatchV4(
+      {
+        runId,
+        events: events.map((event) =>
+          toBatchEventV4Input(runId, event, params)
+        ),
+      },
+      config
+    )
+  );
+
+  // Batch results always resolve their payloads (the runtime re-hydrates
+  // through the decompress-aware helpers), matching the single-create default.
+  const resolveData = DEFAULT_RESOLVE_DATA_OPTION;
+  const delta = result.eventsDelta;
+  return {
+    results: result.results.map((bag) => bagToEventResult(bag, resolveData)),
+    events: delta?.events
+      ? (delta.events as Record<string, unknown>[]).map(coerceEventDates)
+      : undefined,
+    cursor: delta?.cursor ?? undefined,
+    hasMore: delta?.hasMore,
   };
 }

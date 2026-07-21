@@ -301,3 +301,47 @@ export async function withEventPostRetry<T>(
     }
   }
 }
+
+/**
+ * Run a batch event POST, retrying transient transport failures in-process.
+ *
+ * A batch transition (step_completed(N) + step_created(N+1) + step_started(N+1))
+ * is idempotent-on-retry as a whole: the server applies it all-or-nothing and a
+ * retry whose original already landed returns 200 with the current entities. So
+ * unlike a single `step_started` (which is NOT retryable — its handler does an
+ * unconditional attempt increment), the batch as a unit rides out a transport
+ * blip without re-executing anything. Definitive responses — a 409 all-or-nothing
+ * conflict, a 404/405 (endpoint absent), and every other 4xx — surface
+ * immediately, exactly like a single create. Uses the same transient/5xx
+ * classification ({@link isRetryableEventPostError}) and backoff budget as the
+ * single-event retry.
+ */
+export async function withBatchPostRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const transient = isRetryableEventPostError(err);
+      if (transient && attempt < MAX_EVENT_POST_RETRIES) {
+        const backoff =
+          EVENT_POST_RETRY_BASE_MS * 2 ** attempt +
+          Math.floor(Math.random() * EVENT_POST_RETRY_JITTER_MS);
+        logRetry('retrying batch POST after transient failure', {
+          eventType: 'batch',
+          attempt: attempt + 1,
+          backoffMs: backoff,
+          error: errorMarker(err),
+        });
+        await sleep(backoff);
+        continue;
+      }
+      if (transient) {
+        logRetry(
+          'exhausted in-process batch retries; surfacing for queue redelivery',
+          { eventType: 'batch', attempts: attempt + 1, error: errorMarker(err) }
+        );
+      }
+      throw err;
+    }
+  }
+}

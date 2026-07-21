@@ -796,6 +796,60 @@ export interface EventResult {
   stepCreated?: boolean;
 }
 
+/**
+ * Parameters for {@link World.events.createBatch} — an ordered, all-or-nothing
+ * write of a sequence of events for one run in a single round-trip. Mirrors the
+ * batch-relevant fields of {@link CreateEventParams} (per-event fields like
+ * `resolveData` are carried on each event's own request shape).
+ */
+export interface CreateBatchParams {
+  /** Request ID (x-vercel-id when on Vercel) for correlating request logs with the batch. */
+  requestId?: string;
+  /**
+   * Optimistic-concurrency snapshot for the whole batch (epoch ms of the latest
+   * event the runtime had loaded during replay). A guard-enforcing World rejects
+   * the entire batch with `PreconditionFailedError` (412) when a newer
+   * out-of-band event was recorded after this snapshot — applied atomically to
+   * the batch, exactly like the single-event guard (see
+   * {@link CreateEventParams.stateUpdatedAt}). Omitted when the guard is
+   * disabled or the caller has no loaded log; Worlds that don't enforce the
+   * guard ignore it.
+   */
+  stateUpdatedAt?: number;
+  /**
+   * Inline-delta request for the batch, with the same semantics as
+   * {@link CreateEventParams.sinceCursor}: when set, a supporting World MAY
+   * return on {@link BatchEventResult} the first page of events written strictly
+   * after this cursor (`events`/`cursor`/`hasMore`), so the inline loop can skip
+   * a follow-up `events.list`. The delta is computed atomically against the same
+   * log the batch commits to, preserving the same divergence guarantees as the
+   * fetch path. OPTIONAL to honor — a World that omits it is fully supported and
+   * the runtime falls back to `events.list`.
+   */
+  sinceCursor?: string;
+}
+
+/**
+ * Result of {@link World.events.createBatch}. `results` holds one
+ * {@link EventResult} per input event, in request order, each with the same
+ * materialized-entity shape a single {@link World.events.create} returns for
+ * that event type (so a `step_started` element carries its running `step`, a
+ * `step_completed` element carries the completed `step`, etc.). The batch-level
+ * `events`/`cursor`/`hasMore` carry the optional inline delta requested via
+ * {@link CreateBatchParams.sinceCursor} — the same fields {@link EventResult}
+ * exposes for a single step-terminal write — computed once for the whole batch.
+ */
+export interface BatchEventResult {
+  /** Per-event materialized results, in request order. */
+  results: EventResult[];
+  /** Inline delta written strictly after `sinceCursor` (events.list semantics). */
+  events?: Event[];
+  /** Pagination cursor for `events`, matching events.list semantics. */
+  cursor?: string | null;
+  /** Whether additional event pages are available for `events`. */
+  hasMore?: boolean;
+}
+
 export interface GetEventParams {
   resolveData?: ResolveData;
 }

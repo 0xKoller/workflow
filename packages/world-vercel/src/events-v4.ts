@@ -404,6 +404,126 @@ export async function createWorkflowRunEventV4(
   return { eventId, runId, createdAt, body };
 }
 
+/** One event in a batch POST — the same per-event input shape a single
+ *  create uses. Batch-level params (`sinceCursor`, `stateUpdatedAt`) are NOT
+ *  separate fields: they ride in the `step_completed` frame's own meta, exactly
+ *  as they do on a single `step_completed` POST, because the server reads them
+ *  from that frame (see workflow-server `createEventBatchHandlerV4`). The
+ *  adapter (`createWorkflowRunEventsBatch`) is responsible for setting them on
+ *  the right frame before calling this wire function. */
+export type BatchEventV4Input = CreateEventV4Input;
+
+export interface CreateEventBatchV4Input {
+  runId: string;
+  /** Ordered events to apply atomically (length 1..N, never run_created).
+   *  Each frame is byte-identical to a single-event POST body; the server
+   *  parses them strictly in order to EOF. */
+  events: BatchEventV4Input[];
+}
+
+export interface CreateEventBatchV4Result {
+  /** One materialized-entity bag per input event, in request order — the same
+   *  `body` shape {@link CreateEventV4Result} returns for a single create. */
+  results: CreateEventV4Result['body'][];
+  /** Optional inline delta for the whole batch (present when a `sinceCursor`
+   *  rode on the `step_completed` frame and the batch committed). Server sends
+   *  it as a NESTED `eventsDelta` object. */
+  eventsDelta?: {
+    events?: unknown[];
+    cursor?: string | null;
+    hasMore?: boolean;
+  };
+}
+
+/**
+ * POST /api/v4/runs/:runId/events/batch
+ *
+ * Atomic, all-or-nothing write of an ordered event sequence for one run,
+ * collapsing a step transition (complete step N + create & start step N+1)
+ * into a single round-trip.
+ *
+ * Wire format (matches the workflow-server batch handler byte for byte — see
+ * vercel/workflow-server pgp/batch-step-transitions, `V4BatchFrameReader`):
+ *
+ *   request body := eventFrame+           (Content-Type: application/octet-stream)
+ *   eventFrame   := the SAME single-POST frame layout — u32_be(meta_len) ||
+ *                   cbor(buildPostFrameMeta(event)) || u32_be(body_len) ||
+ *                   payload_bytes — one per event, in order, back-to-back with
+ *                   NO envelope and NO terminator. The server loops
+ *                   `readHeader()` until the body is exhausted.
+ *
+ *   Batch-level params ride on individual frames' meta, not a wrapper: the
+ *   server reads `sinceCursor` / `stateUpdatedAt` off the `step_completed`
+ *   frame (its "primary"), and `vercelId` per frame — exactly the single-POST
+ *   encoding. The caller sets them via {@link buildPostFrameMeta}'s inputs.
+ *
+ *   response 200 := ONE CBOR map { results: bag[], eventsDelta?: { events,
+ *                   cursor, hasMore } } where bag[i] is the single-POST
+ *                   materialized-entity body for event i, in order.
+ *   response 409 := all-or-nothing conflict (nothing written) → EntityConflictError.
+ *   response 410 := run not running (pre-read) → RunExpiredError.
+ *   response 412 := stale snapshot → PreconditionFailedError.
+ *   response 404/405 := endpoint absent (older server) → WorkflowWorldError,
+ *                   which the runtime treats as "disable batching for this
+ *                   invocation" and falls back to single creates.
+ */
+export async function createWorkflowRunEventsBatchV4(
+  input: CreateEventBatchV4Input,
+  config?: APIConfig
+): Promise<CreateEventBatchV4Result> {
+  const { baseUrl, headers: baseHeaders } = await getHttpConfig(config);
+  const headers = new Headers(baseHeaders);
+  // Match the single-event POST content type — the batch route runs on the
+  // same authed + v4 middleware chain and the frame bytes are identical.
+  headers.set('Content-Type', 'application/octet-stream');
+
+  const frames: Uint8Array[] = input.events.map((event) =>
+    encodeFrame(buildPostFrameMeta(event), event.payload ?? new Uint8Array(0))
+  );
+  const body = concatFrames(frames);
+
+  const url = `${baseUrl}/v4/runs/${encodeURIComponent(input.runId)}/events/batch`;
+  const response = await fetchV4(
+    url,
+    { method: 'POST', headers, body },
+    config,
+    'createEventBatch'
+  );
+
+  const bodyBytes = new Uint8Array(await response.arrayBuffer());
+  const decoded =
+    bodyBytes.byteLength > 0
+      ? (decode(bodyBytes) as {
+          results?: unknown[];
+          eventsDelta?: {
+            events?: unknown[];
+            cursor?: string | null;
+            hasMore?: boolean;
+          };
+        })
+      : {};
+  const results = Array.isArray(decoded.results)
+    ? (decoded.results as CreateEventV4Result['body'][])
+    : [];
+  return {
+    results,
+    ...(decoded.eventsDelta ? { eventsDelta: decoded.eventsDelta } : {}),
+  };
+}
+
+/** Concatenate pre-encoded frames into one request body buffer. */
+function concatFrames(frames: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const f of frames) total += f.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const f of frames) {
+    out.set(f, offset);
+    offset += f.byteLength;
+  }
+  return out;
+}
+
 /**
  * Decoded event entity returned by GET /api/v4/runs/:runId/events/:eventId.
  * The server CBOR-encodes the full entity with refs resolved server-side,
