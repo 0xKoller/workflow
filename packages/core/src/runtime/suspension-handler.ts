@@ -56,6 +56,23 @@ export interface SuspensionHandlerParams {
    * where `run_started` was already awaited up front.
    */
   runReadyBarrier?: Promise<unknown>;
+  /**
+   * Collect-mode (WORKFLOW_BATCH_TRANSITIONS suspension batching): when true,
+   * the batchable events this suspension would otherwise write individually —
+   * pending (queued) `step_created`, `wait_created`, and abort `hook_received`
+   * — are BUFFERED into {@link SuspensionHandlerResult.batchFrames} instead of
+   * being written, so the caller can commit them in one fenced `createBatch`.
+   * The non-batchable events (`hook_created` / `hook_disposed` / `attr_set`)
+   * are still written individually here, and lazy-inline steps are deferred as
+   * usual (the caller assembles their born-running pairs from
+   * {@link SuspensionHandlerResult.lazyInlineSteps}). Ownership of a buffered
+   * pending step is NOT recorded in `createdStepCorrelationIds` — the batch is
+   * all-or-nothing, so the caller owns every buffered claim iff the batch
+   * commits. Off by default; the caller only enables it for a batch-eligible
+   * suspension (no turbo, no open hook/wait, no attr writes). The best-effort
+   * abort stream packet is still written here regardless (it is not batchable).
+   */
+  collectBatchFrames?: boolean;
 }
 
 /**
@@ -121,6 +138,20 @@ export interface SuspensionHandlerResult {
    * durably creating the user's hooks doesn't count as runtime overhead.
    */
   hookCreationMs: number;
+  /**
+   * Collect-mode only ({@link SuspensionHandlerParams.collectBatchFrames}): the
+   * batchable events this suspension buffered instead of writing, in
+   * deterministic (queue-insertion) order per category, ready for
+   * `assembleSuspensionBatch`. `undefined` outside collect-mode. Each category
+   * may be empty. The caller combines these with its own leading deferred
+   * completion, the inline born-running pairs (from {@link lazyInlineSteps}),
+   * and any terminal run event, then commits ONE fenced `createBatch`.
+   */
+  batchFrames?: {
+    pendingCreates: CreateEventRequest[];
+    waits: CreateEventRequest[];
+    hookReceiveds: CreateEventRequest[];
+  };
 }
 
 async function createHookEvent({
@@ -205,8 +236,19 @@ export async function handleSuspension({
   requestId,
   eventLog,
   runReadyBarrier,
+  collectBatchFrames,
 }: SuspensionHandlerParams): Promise<SuspensionHandlerResult> {
   const runId = run.runId;
+
+  // Collect-mode: buffer batchable events (pending step_created, wait_created,
+  // abort hook_received) keyed by correlationId instead of writing them, so the
+  // caller can commit them in one fenced batch. Rebuilt into deterministic
+  // per-category arrays after the parallel ops settle. Empty/unused outside
+  // collect-mode. See SuspensionHandlerParams.collectBatchFrames.
+  const collecting = collectBatchFrames === true;
+  const pendingCreateFrames = new Map<string, CreateEventRequest>();
+  const waitFrames = new Map<string, CreateEventRequest>();
+  const hookReceivedFrames = new Map<string, CreateEventRequest>();
 
   // Turbo mode: hold every world write below until the backgrounded
   // `run_started` has *settled*, so we never write a step/hook/wait event for a
@@ -418,8 +460,10 @@ export async function handleSuspension({
             compression
           );
 
-          // Create hook_received event with abort payload
-          await createGuarded({
+          // Create hook_received event with abort payload. Collect-mode
+          // buffers the event for the batch instead of writing it (the stream
+          // packet below is still written — it is not batchable).
+          const hookReceivedEvent: CreateEventRequest = {
             eventType: 'hook_received' as const,
             specVersion: SPEC_VERSION_CURRENT,
             correlationId: queueItem.correlationId,
@@ -427,7 +471,12 @@ export async function handleSuspension({
               token: queueItem.token,
               payload: abortPayload,
             },
-          });
+          };
+          if (collecting) {
+            hookReceivedFrames.set(queueItem.correlationId, hookReceivedEvent);
+          } else {
+            await createGuarded(hookReceivedEvent);
+          }
 
           // Write stream cancellation packet for real-time step propagation.
           // Reuse the same dehydrated payload as the hook event so the reason
@@ -557,6 +606,14 @@ export async function handleSuspension({
               input: dehydratedInput as SerializedData,
             },
           };
+          // Collect-mode: buffer the pending create for the batch instead of
+          // writing it. Ownership is NOT recorded here — the batch is
+          // all-or-nothing, so the caller owns every buffered claim iff the
+          // batch commits (and queues those steps only then).
+          if (collecting) {
+            pendingCreateFrames.set(queueItem.correlationId, stepEvent);
+            return;
+          }
           try {
             await ensureRunReady();
             await createGuarded(stepEvent, { requestId });
@@ -590,6 +647,12 @@ export async function handleSuspension({
               resumeAt: queueItem.resumeAt,
             },
           };
+          // Collect-mode: buffer the wait_created for the batch instead of
+          // writing it.
+          if (collecting) {
+            waitFrames.set(queueItem.correlationId, waitEvent);
+            return;
+          }
           try {
             await ensureRunReady();
             await createGuarded(waitEvent, { requestId });
@@ -704,6 +767,28 @@ export async function handleSuspension({
     ...Attribute.WorkflowWaitsCreated(waitItems.length),
   });
 
+  // Collect-mode: rebuild the buffered batchable frames in deterministic
+  // (queue-insertion) order per category, so the assembled batch is stable
+  // regardless of the parallel ops' settle order.
+  const batchFrames = collecting
+    ? {
+        pendingCreates: stepItems
+          .filter((s) => pendingCreateFrames.has(s.correlationId))
+          .map(
+            (s) =>
+              pendingCreateFrames.get(s.correlationId) as CreateEventRequest
+          ),
+        waits: waitItems
+          .filter((w) => waitFrames.has(w.correlationId))
+          .map((w) => waitFrames.get(w.correlationId) as CreateEventRequest),
+        hookReceiveds: allHookItems
+          .filter((h) => hookReceivedFrames.has(h.correlationId))
+          .map(
+            (h) => hookReceivedFrames.get(h.correlationId) as CreateEventRequest
+          ),
+      }
+    : undefined;
+
   return {
     pendingSteps: stepItems,
     createdStepCorrelationIds,
@@ -716,6 +801,7 @@ export async function handleSuspension({
     hasAttributeEvents: attributeItems.length > 0,
     hasHookEvents: hooksNeedingCreation.length > 0,
     hookCreationMs,
+    ...(batchFrames ? { batchFrames } : {}),
   };
 }
 

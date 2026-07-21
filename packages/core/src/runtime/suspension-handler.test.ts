@@ -326,6 +326,111 @@ describe('handleSuspension', () => {
     ]);
   });
 
+  it('collect-mode: buffers pending creates + waits into batchFrames instead of writing them', async () => {
+    // 4 parallel steps + a wait. With getMaxInlineSteps()=3, s1-s3 are deferred
+    // (lazy inline, no write) and s4 is the eager pending create — which, in
+    // collect-mode, is buffered rather than written. The wait is buffered too.
+    const eventsCreate = vi.fn().mockResolvedValue({
+      event: { eventType: 'step_created' },
+    });
+    const world = createWorld(eventsCreate);
+    const pending = new Map<string, unknown>([
+      ...['s1', 's2', 's3', 's4'].map(
+        (id) =>
+          [
+            id,
+            {
+              type: 'step' as const,
+              correlationId: id,
+              stepName: id,
+              args: [],
+            },
+          ] as const
+      ),
+      [
+        'w1',
+        {
+          type: 'wait' as const,
+          correlationId: 'w1',
+          resumeAt: new Date(Date.now() + 60_000),
+        },
+      ],
+    ]);
+
+    const result = await handleSuspension({
+      // biome-ignore lint/suspicious/noExplicitAny: heterogeneous test map
+      suspension: new WorkflowSuspension(pending as any, globalThis),
+      world,
+      run,
+      collectBatchFrames: true,
+    });
+
+    // Nothing was written: the pending create and the wait were buffered, and
+    // the lazy-inline steps defer as usual.
+    expect(eventsCreate).not.toHaveBeenCalled();
+    // The eager (non-lazy) step is buffered as a pending create; ownership is
+    // NOT recorded (the batch is all-or-nothing).
+    expect(
+      result.batchFrames?.pendingCreates.map((e) => e.correlationId)
+    ).toEqual(['s4']);
+    expect([...result.createdStepCorrelationIds]).toEqual([]);
+    // The wait is buffered as a wait_created frame.
+    expect(result.batchFrames?.waits.map((e) => e.correlationId)).toEqual([
+      'w1',
+    ]);
+    expect(result.batchFrames?.hookReceiveds).toEqual([]);
+    // Lazy-inline steps are still returned for the caller to born-run inline.
+    expect(result.lazyInlineSteps.map((s) => s.correlationId)).toEqual([
+      's1',
+      's2',
+      's3',
+    ]);
+    // The wait timeout is still reported so the caller arms the continuation.
+    expect(result.waitTimeout?.correlationId).toBe('w1');
+  });
+
+  it('collect-mode off (default): still writes the pending create and wait', async () => {
+    const eventsCreate = vi.fn().mockResolvedValue({
+      event: { eventType: 'step_created' },
+    });
+    const world = createWorld(eventsCreate);
+    // 4 steps so s4 is the eager (non-lazy) pending create (getMaxInlineSteps=3).
+    const pending = new Map<string, unknown>([
+      ...['s1', 's2', 's3', 's4'].map(
+        (id) =>
+          [
+            id,
+            {
+              type: 'step' as const,
+              correlationId: id,
+              stepName: id,
+              args: [],
+            },
+          ] as const
+      ),
+      [
+        'w1',
+        {
+          type: 'wait' as const,
+          correlationId: 'w1',
+          resumeAt: new Date(Date.now() + 60_000),
+        },
+      ],
+    ]);
+
+    const result = await handleSuspension({
+      // biome-ignore lint/suspicious/noExplicitAny: heterogeneous test map
+      suspension: new WorkflowSuspension(pending as any, globalThis),
+      world,
+      run,
+    });
+
+    // Default path writes both the step_created and the wait_created.
+    const written = eventsCreate.mock.calls.map(([, e]) => e.eventType).sort();
+    expect(written).toEqual(['step_created', 'wait_created']);
+    expect(result.batchFrames).toBeUndefined();
+  });
+
   it('does not dispose a hook whose creation conflicted', async () => {
     const eventsCreate = vi.fn(async (_runId, event) => {
       if (event.eventType === 'hook_created') {
