@@ -281,6 +281,128 @@ function map<T, R>(obj: T | null | undefined, fn: (v: T) => R): undefined | R {
 }
 
 /**
+ * A classified suspension-batch operation, tagged by role, keyed to the input
+ * event position(s) that produced it. Module-level so `createBatch` stays
+ * bounded in complexity; mirrors world-local's `LocalBatchOp` and the server's
+ * `BatchOp`.
+ */
+type PostgresBatchOp =
+  | { kind: 'outcome'; index: number; req: CreateEventRequest }
+  | {
+      kind: 'step-run';
+      createdIndex: number;
+      startedIndex: number;
+      created: CreateEventRequest;
+      started: CreateEventRequest;
+    }
+  | { kind: 'step-pending'; index: number; req: CreateEventRequest }
+  | { kind: 'wait'; index: number; req: CreateEventRequest }
+  | { kind: 'hook-received'; index: number; req: CreateEventRequest }
+  | { kind: 'terminal'; index: number; req: CreateEventRequest };
+
+/**
+ * Validate a suspension batch against the grammar and classify its ordered
+ * events into positional {@link PostgresBatchOp}s, mirroring workflow-server's
+ * `classifySuspensionBatch` (lib/data/events.ts) and world-local's
+ * `classifyLocalSuspensionBatch`. Throws `WorkflowWorldError` on any grammar
+ * violation. Pure — no I/O. The caller gates the full grammar on the fence (the
+ * unfenced path additionally restricts to the v1 triple):
+ *
+ *   (step_completed | step_failed)?          # leading outcome (index 0)
+ *   ( wait_created | wait_completed | hook_received
+ *     | (step_created step_started)          # inline born-running step
+ *     | step_created )*                      # queued (pending) fan-out step
+ *   (run_completed | run_failed)?            # terminal, MUST be last
+ */
+function classifyPostgresSuspensionBatch(
+  batchEvents: CreateEventRequest[]
+): PostgresBatchOp[] {
+  const ops: PostgresBatchOp[] = [];
+  const seenSteps = new Set<string>();
+  const claimStep = (req: CreateEventRequest, index: number): void => {
+    const id = req.correlationId;
+    if (typeof id !== 'string') {
+      throw new WorkflowWorldError(
+        `world-postgres: createBatch event ${index} (${req.eventType}) requires a correlationId`
+      );
+    }
+    if (seenSteps.has(id)) {
+      throw new WorkflowWorldError(
+        `world-postgres: createBatch references step ${id} more than once`
+      );
+    }
+    seenSteps.add(id);
+  };
+
+  let i = 0;
+  const first = batchEvents[0].eventType;
+  if (first === 'step_completed' || first === 'step_failed') {
+    claimStep(batchEvents[0], 0);
+    ops.push({ kind: 'outcome', index: 0, req: batchEvents[0] });
+    i = 1;
+  }
+  while (i < batchEvents.length) {
+    const e = batchEvents[i];
+    if (e.eventType === 'step_completed' || e.eventType === 'step_failed') {
+      throw new WorkflowWorldError(
+        `world-postgres: a ${e.eventType} may only lead a suspension batch (index 0)`
+      );
+    }
+    if (e.eventType === 'run_completed' || e.eventType === 'run_failed') {
+      if (i !== batchEvents.length - 1) {
+        throw new WorkflowWorldError(
+          `world-postgres: a terminal ${e.eventType} must be the last batch event`
+        );
+      }
+      ops.push({ kind: 'terminal', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    if (e.eventType === 'step_created') {
+      claimStep(e, i);
+      const next = batchEvents[i + 1];
+      if (
+        next &&
+        next.eventType === 'step_started' &&
+        next.correlationId === e.correlationId
+      ) {
+        ops.push({
+          kind: 'step-run',
+          createdIndex: i,
+          startedIndex: i + 1,
+          created: e,
+          started: next,
+        });
+        i += 2;
+      } else {
+        ops.push({ kind: 'step-pending', index: i, req: e });
+        i += 1;
+      }
+      continue;
+    }
+    if (e.eventType === 'step_started') {
+      throw new WorkflowWorldError(
+        'world-postgres: a step_started must be immediately preceded by its step_created'
+      );
+    }
+    if (e.eventType === 'wait_created' || e.eventType === 'wait_completed') {
+      ops.push({ kind: 'wait', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    if (e.eventType === 'hook_received') {
+      ops.push({ kind: 'hook-received', index: i, req: e });
+      i += 1;
+      continue;
+    }
+    throw new WorkflowWorldError(
+      `world-postgres: unsupported eventType '${e.eventType}' in a suspension batch`
+    );
+  }
+  return ops;
+}
+
+/**
  * Handle events for legacy runs (pre-event-sourcing, specVersion < 2).
  * Legacy runs use different behavior:
  * - run_cancelled: Skip event storage, directly update run
@@ -1805,23 +1927,74 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
       const now = new Date();
       const terminalStepStatuses: (typeof Schema.steps.status.enumValues)[number][] =
         [...TERMINAL_STEP_STATUSES];
+      const terminalRunStatuses: (typeof Schema.runs.status.enumValues)[number][] =
+        [...TERMINAL_WORKFLOW_RUN_STATUSES];
+
+      // Classify + validate the ordered events into positional ops (mirrors
+      // world-local's `classifyLocalSuspensionBatch` and workflow-server's
+      // `classifySuspensionBatch`). Pure — each input index maps to exactly one
+      // result position. The UNFENCED (legacy / direct-test) path keeps the v1
+      // triple-only contract; the full suspension grammar is admitted only when
+      // a `batchId` fence is present (the runtime always supplies it for a v2
+      // run), so existing unfenced callers are unaffected.
+      const ops = classifyPostgresSuspensionBatch(batchEvents);
+      const stepRunOps = ops.filter(
+        (o): o is Extract<PostgresBatchOp, { kind: 'step-run' }> =>
+          o.kind === 'step-run'
+      );
+      const isV1Triple =
+        stepRunOps.length === 1 &&
+        ops.every((o) => o.kind === 'outcome' || o.kind === 'step-run');
+      const batchId = params?.batchId;
+      const expectedRunVersion = params?.expectedRunVersion;
+      const fenced = batchId !== undefined;
+      if (!fenced && !isV1Triple) {
+        throw new WorkflowWorldError(
+          'world-postgres: unfenced createBatch supports only the [step_completed?, step_created, step_started] transition; the full suspension grammar requires the v2 fence (batchId)'
+        );
+      }
 
       return drizzle.transaction(async (tx) => {
-        const results: EventResult[] = [];
-        // correlationIds whose step_created frame won its create-claim in THIS
-        // batch — the born-running set. A step_started for a correlationId in
-        // this set is the create-claim winner (stepCreated: true); one absent
-        // from it lost the race / was already applied (stepCreated omitted).
-        const bornRunning = new Set<string>();
+        // Positional result array — one entry per input event index. A
+        // `step-run` op fills two positions (created + started); every other op
+        // fills one.
+        const results: EventResult[] = new Array(batchEvents.length);
 
-        // v2 suspension-batch fence. Present iff the caller supplies a batchId
-        // (the runtime always does for a v2 run); a fence-less caller keeps the
-        // exact v1 behavior. Lock the run row FOR UPDATE so the version check
-        // and the advance below are a genuine CAS within this transaction.
-        const batchId = params?.batchId;
-        const expectedRunVersion = params?.expectedRunVersion;
-        const fenced = batchId !== undefined;
-        let alreadyApplied = false;
+        // Positional materialization of the batch's current step entities — for
+        // an idempotent / already-applied return (no writes, no `stepCreated`).
+        // Only step entities are read (the client inspects nothing else here),
+        // mirroring world-local's `currentResults`.
+        const currentResults = async (): Promise<EventResult[]> => {
+          const out: EventResult[] = [];
+          for (const e of batchEvents) {
+            if (
+              typeof e.correlationId === 'string' &&
+              (e.eventType === 'step_created' ||
+                e.eventType === 'step_started' ||
+                e.eventType === 'step_completed' ||
+                e.eventType === 'step_failed')
+            ) {
+              const [row] = await tx
+                .select()
+                .from(Schema.steps)
+                .where(
+                  and(
+                    eq(Schema.steps.runId, runId),
+                    eq(Schema.steps.stepId, e.correlationId)
+                  )
+                )
+                .limit(1);
+              out.push(row ? { step: deserializeStepError(compact(row)) } : {});
+            } else {
+              out.push({});
+            }
+          }
+          return out;
+        };
+
+        // v2 suspension-batch fence. Present iff the caller supplied a batchId.
+        // Lock the run row FOR UPDATE so the version check and the advance below
+        // are a genuine CAS within this transaction.
         let currentRunVersion: number | undefined;
         if (fenced) {
           const [runRow] = await tx
@@ -1848,18 +2021,63 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               { status: 409, code: 'run-not-versioned' }
             );
           }
+          // Idempotent already-applied: the SAME batch committed earlier (a
+          // transport retry / redelivery). Return the current entities without
+          // `stepCreated` and WRITE NOTHING — a whole-batch short-circuit
+          // (world-local's proven shape). The client re-derives from a fresh
+          // replay. This removes every per-branch already-applied gate below and
+          // with it any risk of minting a duplicate eventId on a retry.
           if (runRow.lastBatchId === batchId) {
-            // Idempotent already-applied: the SAME batch committed earlier. The
-            // per-frame loop below runs read-only (every write is skipped as a
-            // duplicate) and the version advance is skipped.
-            alreadyApplied = true;
-          } else if (expectedRunVersion !== currentRunVersion) {
-            // Optimistic-concurrency fence: a different write advanced the run.
-            // Abort all-or-nothing (rolls back) — the client abandons the
-            // deferred completion and re-derives from a fresh replay.
+            return {
+              results: await currentResults(),
+              runVersion: currentRunVersion,
+              lastBatchId: batchId,
+            };
+          }
+          // Optimistic-concurrency fence: a different write advanced the run
+          // since the client's snapshot. Abort all-or-nothing (rolls back) — the
+          // client abandons the deferred completion and re-derives.
+          if (expectedRunVersion !== currentRunVersion) {
             throw new EntityConflictError(
               `world-postgres: suspension-batch run-version conflict (expected ${expectedRunVersion}, run at ${currentRunVersion})`
             );
+          }
+        }
+
+        // v1 idempotency (triple only): if the lone born-running step already
+        // exists running/terminal, the transition committed earlier. Write
+        // nothing and return current entities WITHOUT `stepCreated` so the
+        // client re-derives instead of double-running the body. The fenced
+        // general path relies on `lastBatchId` (above) + the per-op create-claim
+        // instead, so this peek is scoped to the triple.
+        if (isV1Triple) {
+          const [existing] = await tx
+            .select()
+            .from(Schema.steps)
+            .where(
+              and(
+                eq(Schema.steps.runId, runId),
+                // biome-ignore lint/style/noNonNullAssertion: classifier claimStep guarantees a string correlationId
+                eq(Schema.steps.stepId, stepRunOps[0].created.correlationId!)
+              )
+            )
+            .limit(1);
+          const existingStep = existing
+            ? deserializeStepError(compact(existing))
+            : undefined;
+          if (
+            existingStep &&
+            (existingStep.status === 'running' ||
+              isTerminalStepStatus(existingStep.status))
+          ) {
+            const idempotent = await currentResults();
+            return fenced
+              ? {
+                  results: idempotent,
+                  runVersion: currentRunVersion,
+                  lastBatchId: batchId,
+                }
+              : { results: idempotent };
           }
         }
 
@@ -1913,168 +2131,395 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           return row ? deserializeStepError(compact(row)) : undefined;
         };
 
-        for (const data of batchEvents) {
-          const correlationId = data.correlationId;
-          if (!correlationId) {
-            throw new WorkflowWorldError(
-              `world-postgres: createBatch event "${data.eventType}" requires a correlationId`
-            );
-          }
-
-          if (data.eventType === 'step_completed') {
-            const eventData = (data as { eventData?: { result?: unknown } })
-              .eventData;
-            const [stepValue] = await tx
-              .update(Schema.steps)
-              .set({
-                status: 'completed',
-                output: eventData?.result as SerializedContent | undefined,
-                completedAt: now,
-              })
-              .where(
-                and(
-                  eq(Schema.steps.runId, runId),
-                  eq(Schema.steps.stepId, correlationId),
-                  notInArray(Schema.steps.status, terminalStepStatuses)
-                )
-              )
-              .returning();
-            if (stepValue) {
-              const step = deserializeStepError(compact(stepValue));
-              const event = await insertEvent(data, eventData);
-              results.push({ event, step });
-            } else {
-              // 0 rows: the step is missing or already terminal.
-              const existing = await readStep(correlationId);
-              if (!existing) {
-                throw new WorkflowWorldError(
-                  `Step "${correlationId}" not found`
-                );
-              }
-              if (existing.status === 'completed') {
-                // Idempotent: a prior (or concurrent) commit of this exact
-                // transition already completed step N. Reuse the durable row;
-                // writing a second step_completed event would duplicate it (it
-                // is not covered by the entity-creation unique index).
-                results.push({ step: existing });
-              } else {
-                // failed / cancelled: genuine conflict — roll the batch back.
-                throw new EntityConflictError(
-                  `Cannot modify step in terminal state "${existing.status}"`
-                );
-              }
-            }
-          } else if (data.eventType === 'step_created') {
-            const eventData = (
-              data as { eventData: { stepName: string; input: unknown } }
-            ).eventData;
-            const [inserted] = await tx
-              .insert(Schema.steps)
-              .values({
-                runId,
-                stepId: correlationId,
-                stepName: eventData.stepName,
-                input: eventData.input as SerializedContent,
-                status: 'pending',
-                attempt: 0,
-                specVersion: data.specVersion ?? SPEC_VERSION_CURRENT,
-              })
-              .onConflictDoNothing()
-              .returning();
-            if (inserted) {
-              // Won the create-claim: born-running. Record the step_created
-              // event so replay observes create-before-start.
-              bornRunning.add(correlationId);
-              const step = deserializeStepError(compact(inserted));
-              const event = await insertEvent(data, eventData);
-              results.push({ event, step });
-            } else {
-              // Lost / already-applied: the step already exists. Don't write a
-              // duplicate step_created event (would violate the entity-creation
-              // unique index and abort the whole batch).
-              const existing = await readStep(correlationId);
-              results.push(existing ? { step: existing } : {});
-            }
-          } else if (data.eventType === 'step_started') {
-            if (bornRunning.has(correlationId)) {
-              // We created step N+1 in this batch: transition it to running and
-              // stamp the create-claim signal.
-              const [stepValue] = await tx
-                .update(Schema.steps)
-                .set({
-                  status: 'running',
-                  attempt: sql`${Schema.steps.attempt} + 1`,
-                  startedAt: sql`COALESCE(${Schema.steps.startedAt}, ${now.toISOString()})`,
-                  retryAfter: null,
-                })
-                .where(
-                  and(
-                    eq(Schema.steps.runId, runId),
-                    eq(Schema.steps.stepId, correlationId),
-                    notInArray(Schema.steps.status, terminalStepStatuses)
+        // Apply every op in request order, filling one result per input event
+        // position. Ordering is load-bearing: a leading outcome (index 0) is
+        // applied first so completed(N) < created(N+1) holds, and eventIds are
+        // minted in request order. Each op mirrors its single-`create` write; a
+        // genuine conflict throws EntityConflictError and rolls the whole batch
+        // back (all-or-nothing), exactly like the single path. The whole-batch
+        // short-circuit above already handled the same-batch retry, so no op
+        // needs a per-branch already-applied gate.
+        for (const op of ops) {
+          switch (op.kind) {
+            case 'outcome': {
+              // biome-ignore lint/style/noNonNullAssertion: classifier claimStep guarantees a string correlationId
+              const correlationId = op.req.correlationId!;
+              if (op.req.eventType === 'step_completed') {
+                const eventData = (
+                  op.req as { eventData?: { result?: unknown } }
+                ).eventData;
+                const [stepValue] = await tx
+                  .update(Schema.steps)
+                  .set({
+                    status: 'completed',
+                    output: eventData?.result as SerializedContent | undefined,
+                    completedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(Schema.steps.runId, runId),
+                      eq(Schema.steps.stepId, correlationId),
+                      notInArray(Schema.steps.status, terminalStepStatuses)
+                    )
                   )
-                )
-                .returning();
-              if (!stepValue) {
-                // The step we just created cannot already be terminal — a
-                // 0-row update here is a real invariant violation.
-                throw new WorkflowWorldError(
-                  `Step "${correlationId}" could not be started in batch`
-                );
+                  .returning();
+                if (stepValue) {
+                  const step = deserializeStepError(compact(stepValue));
+                  const event = await insertEvent(op.req, eventData);
+                  results[op.index] = { event, step };
+                } else {
+                  // 0 rows: the step is missing or already terminal.
+                  const existing = await readStep(correlationId);
+                  if (!existing) {
+                    throw new WorkflowWorldError(
+                      `Step "${correlationId}" not found`
+                    );
+                  }
+                  if (existing.status === 'completed') {
+                    // Idempotent: a prior write already completed step N.
+                    results[op.index] = { step: existing };
+                  } else {
+                    throw new EntityConflictError(
+                      `Cannot modify step in terminal state "${existing.status}"`
+                    );
+                  }
+                }
+              } else {
+                // step_failed: mirror the single path (error stored verbatim in
+                // the error_cbor column; consumers hydrate via hydrateStepError).
+                const eventData = (
+                  op.req as { eventData?: { error?: unknown } }
+                ).eventData;
+                const [stepValue] = await tx
+                  .update(Schema.steps)
+                  .set({
+                    status: 'failed',
+                    error: eventData?.error as SerializedData | undefined,
+                    completedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(Schema.steps.runId, runId),
+                      eq(Schema.steps.stepId, correlationId),
+                      notInArray(Schema.steps.status, terminalStepStatuses)
+                    )
+                  )
+                  .returning();
+                if (stepValue) {
+                  const step = deserializeStepError(compact(stepValue));
+                  const event = await insertEvent(op.req, eventData);
+                  results[op.index] = { event, step };
+                } else {
+                  const existing = await readStep(correlationId);
+                  if (!existing) {
+                    throw new WorkflowWorldError(
+                      `Step "${correlationId}" not found`
+                    );
+                  }
+                  if (existing.status === 'failed') {
+                    results[op.index] = { step: existing };
+                  } else {
+                    throw new EntityConflictError(
+                      `Cannot modify step in terminal state "${existing.status}"`
+                    );
+                  }
+                }
               }
-              const step = deserializeStepError(compact(stepValue));
-              // step_started never carries `input` (it lives on step_created);
-              // strip defensively to match the single path.
-              const { input: _omitInput, ...rest } = ((
-                data as { eventData?: Record<string, unknown> }
-              ).eventData ?? {}) as Record<string, unknown>;
-              const event = await insertEvent(data, rest);
-              results.push({ event, step, stepCreated: true });
-            } else {
-              // We did NOT create step N+1 (already applied by another
-              // committer, or a lost race). Return the current entity WITHOUT
-              // stepCreated so the client re-derives from a fresh replay.
-              const existing = await readStep(correlationId);
-              results.push(existing ? { step: existing } : {});
+              break;
             }
-          } else if (data.eventType === 'wait_created') {
-            // Fan-out wait folded into the batch (collect-mode). Create the wait
-            // entity; write its event only on a FRESH apply. The event insert is
-            // gated on the entity insert succeeding AND !alreadyApplied so an
-            // idempotent same-batchId retry (whose per-frame loop re-runs
-            // read-only) never mints a duplicate wait_created — unlike the
-            // single-event path, an already-present wait here is idempotent
-            // success, not an EntityConflictError.
-            const eventData = (data as { eventData?: { resumeAt?: Date } })
-              .eventData;
-            const waitId = `${runId}-${correlationId}`;
-            const [inserted] = await tx
-              .insert(Schema.waits)
-              .values({
-                waitId,
-                runId,
-                status: 'waiting',
-                resumeAt: eventData?.resumeAt,
-                specVersion: data.specVersion ?? SPEC_VERSION_CURRENT,
-              })
-              .onConflictDoNothing()
-              .returning();
-            if (inserted && !alreadyApplied) {
-              const event = await insertEvent(data, eventData);
-              results.push({ event });
-            } else {
-              results.push({});
+            case 'step-pending': {
+              // A queued (non-inline) fan-out create: write the step entity +
+              // its step_created event; NO `stepCreated` stamp (the server
+              // stamps that only on a born-running started frame).
+              // biome-ignore lint/style/noNonNullAssertion: classifier claimStep guarantees a string correlationId
+              const correlationId = op.req.correlationId!;
+              const eventData = (
+                op.req as { eventData: { stepName: string; input: unknown } }
+              ).eventData;
+              const [inserted] = await tx
+                .insert(Schema.steps)
+                .values({
+                  runId,
+                  stepId: correlationId,
+                  stepName: eventData.stepName,
+                  input: eventData.input as SerializedContent,
+                  status: 'pending',
+                  attempt: 0,
+                  specVersion: op.req.specVersion ?? SPEC_VERSION_CURRENT,
+                })
+                .onConflictDoNothing()
+                .returning();
+              if (inserted) {
+                const step = deserializeStepError(compact(inserted));
+                const event = await insertEvent(op.req, eventData);
+                results[op.index] = { event, step };
+              } else {
+                // Lost / already-applied: don't write a duplicate step_created
+                // event (would violate the entity-creation unique index).
+                const existing = await readStep(correlationId);
+                results[op.index] = existing ? { step: existing } : {};
+              }
+              break;
             }
-          } else {
-            // hook_received / wait_completed / terminal (run_completed|
-            // run_failed) are part of the server grammar but the runtime's
-            // collect-mode does not emit them in a batch today (hook_received is
-            // gated off; wait_completed is the elapsed-wait path; terminal folds
-            // on the completion path — all documented follow-ups). Reject rather
-            // than half-implement an untested branch.
-            throw new WorkflowWorldError(
-              `world-postgres: createBatch does not support event type "${data.eventType}"`
-            );
+            case 'step-run': {
+              // Born-running: fold step_created + step_started. Win the
+              // create-claim, record create-before-start, transition to running,
+              // and stamp `stepCreated` on the started result (the exactly-one
+              // -winner signal the client reads for ownership).
+              //
+              // World divergence (LOW, client-safe): unlike world-vercel's
+              // atomic TransactWriteItems (all inline creates stamp or the whole
+              // tx cancels — mixed is impossible), `onConflictDoNothing` here does
+              // NOT abort the tx. So across a K-step fan-out, if one correlationId
+              // was already created by a concurrent single-event writer, the batch
+              // can commit with a MIXED stamp (some `stepCreated`, some not). The
+              // client's all-or-nothing ownership loop treats any unstamped inline
+              // frame as not-owned → reinvoke(0), runs NO body — so a mixed stamp
+              // never double-runs a body; the fresh step this batch did create is
+              // recovered via owned-recovery (same-messageId reinvoke) or backstop.
+              // Reaching it needs double-delivery + a path-split on world-postgres
+              // (rollout skew / transient batch-disable on exactly one delivery),
+              // which the shared fence + identical seeding otherwise prevent.
+              // biome-ignore lint/style/noNonNullAssertion: classifier claimStep guarantees a string correlationId
+              const correlationId = op.created.correlationId!;
+              const createdData = (
+                op.created as {
+                  eventData: { stepName: string; input: unknown };
+                }
+              ).eventData;
+              const [inserted] = await tx
+                .insert(Schema.steps)
+                .values({
+                  runId,
+                  stepId: correlationId,
+                  stepName: createdData.stepName,
+                  input: createdData.input as SerializedContent,
+                  status: 'pending',
+                  attempt: 0,
+                  specVersion: op.created.specVersion ?? SPEC_VERSION_CURRENT,
+                })
+                .onConflictDoNothing()
+                .returning();
+              if (inserted) {
+                const createdEvent = await insertEvent(op.created, createdData);
+                const [stepValue] = await tx
+                  .update(Schema.steps)
+                  .set({
+                    status: 'running',
+                    attempt: sql`${Schema.steps.attempt} + 1`,
+                    startedAt: sql`COALESCE(${Schema.steps.startedAt}, ${now.toISOString()})`,
+                    retryAfter: null,
+                  })
+                  .where(
+                    and(
+                      eq(Schema.steps.runId, runId),
+                      eq(Schema.steps.stepId, correlationId),
+                      notInArray(Schema.steps.status, terminalStepStatuses)
+                    )
+                  )
+                  .returning();
+                if (!stepValue) {
+                  // The step we just created cannot already be terminal — a
+                  // 0-row update here is a real invariant violation.
+                  throw new WorkflowWorldError(
+                    `Step "${correlationId}" could not be started in batch`
+                  );
+                }
+                const step = deserializeStepError(compact(stepValue));
+                // step_started never carries `input` (it lives on step_created);
+                // strip defensively to match the single path.
+                const { input: _omitInput, ...rest } = ((
+                  op.started as { eventData?: Record<string, unknown> }
+                ).eventData ?? {}) as Record<string, unknown>;
+                const startedEvent = await insertEvent(op.started, rest);
+                results[op.createdIndex] = { event: createdEvent, step };
+                results[op.startedIndex] = {
+                  event: startedEvent,
+                  step,
+                  stepCreated: true,
+                };
+              } else {
+                // Lost / already-applied: return the current entity WITHOUT
+                // `stepCreated` so the client re-derives from a fresh replay.
+                const existing = await readStep(correlationId);
+                const r = existing ? { step: existing } : {};
+                results[op.createdIndex] = r;
+                results[op.startedIndex] = existing ? { step: existing } : {};
+              }
+              break;
+            }
+            case 'wait': {
+              // biome-ignore lint/style/noNonNullAssertion: classifier guarantees a string correlationId
+              const correlationId = op.req.correlationId!;
+              const waitId = `${runId}-${correlationId}`;
+              if (op.req.eventType === 'wait_created') {
+                const eventData = (
+                  op.req as { eventData?: { resumeAt?: Date } }
+                ).eventData;
+                const [inserted] = await tx
+                  .insert(Schema.waits)
+                  .values({
+                    waitId,
+                    runId,
+                    status: 'waiting',
+                    resumeAt: eventData?.resumeAt,
+                    specVersion: op.req.specVersion ?? SPEC_VERSION_CURRENT,
+                  })
+                  .onConflictDoNothing()
+                  .returning();
+                if (!inserted) {
+                  // A different write created this wait — genuine conflict, roll
+                  // back all-or-nothing (the same-batch retry was short-circuited
+                  // above). Mirrors the single path.
+                  throw new EntityConflictError(
+                    `Wait "${correlationId}" already exists`
+                  );
+                }
+                const event = await insertEvent(op.req, eventData);
+                results[op.index] = { event };
+              } else {
+                // wait_completed: transition waiting → completed (idempotent
+                // reject on an already-completed wait, mirroring the single path).
+                const [waitValue] = await tx
+                  .update(Schema.waits)
+                  .set({ status: 'completed', completedAt: now })
+                  .where(
+                    and(
+                      eq(Schema.waits.waitId, waitId),
+                      eq(Schema.waits.status, 'waiting')
+                    )
+                  )
+                  .returning();
+                if (!waitValue) {
+                  const [existing] = await tx
+                    .select({ status: Schema.waits.status })
+                    .from(Schema.waits)
+                    .where(eq(Schema.waits.waitId, waitId))
+                    .limit(1);
+                  if (!existing) {
+                    throw new WorkflowWorldError(
+                      `Wait "${correlationId}" not found`
+                    );
+                  }
+                  throw new EntityConflictError(
+                    `Wait "${correlationId}" already completed`
+                  );
+                }
+                const event = await insertEvent(
+                  op.req,
+                  (op.req as { eventData?: unknown }).eventData
+                );
+                results[op.index] = { event };
+              }
+              break;
+            }
+            case 'hook-received': {
+              // Event-insert only: world-postgres has no hook_received entity
+              // mutation (see handleLegacyEventPostgres note and the single
+              // path). Not emitted by collect-mode today (the runtime gates on
+              // abortCount === 0); implemented for full world-local parity so a
+              // grammar-legal batch never hits an unsupported-type reject.
+              const event = await insertEvent(
+                op.req,
+                (op.req as { eventData?: unknown }).eventData
+              );
+              results[op.index] = { event };
+              break;
+            }
+            case 'terminal': {
+              // run_completed | run_failed as the last batch event: update run
+              // status, delete hooks + waits (token reuse), record the event.
+              // Mirrors the single path. Not emitted by collect-mode today
+              // (terminal folding is a documented follow-up gated on #3023);
+              // implemented for full world-local parity.
+              let run: WorkflowRun | undefined;
+              if (op.req.eventType === 'run_completed') {
+                const eventData = (
+                  op.req as { eventData?: { output?: unknown } }
+                ).eventData;
+                const [runValue] = await tx
+                  .update(Schema.runs)
+                  .set({
+                    status: 'completed',
+                    output: eventData?.output as SerializedContent | undefined,
+                    completedAt: now,
+                    updatedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(Schema.runs.runId, runId),
+                      notInArray(Schema.runs.status, terminalRunStatuses)
+                    )
+                  )
+                  .returning();
+                if (runValue) {
+                  run = deserializeRunError(compact(runValue));
+                } else {
+                  const [existing] = await tx
+                    .select({ status: Schema.runs.status })
+                    .from(Schema.runs)
+                    .where(eq(Schema.runs.runId, runId))
+                    .limit(1);
+                  if (!existing) {
+                    throw new WorkflowRunNotFoundError(runId);
+                  }
+                  if (isTerminalWorkflowRunStatus(existing.status)) {
+                    throw new EntityConflictError(
+                      `Cannot transition run from terminal state "${existing.status}"`
+                    );
+                  }
+                }
+              } else {
+                const eventData = (
+                  op.req as {
+                    eventData?: { error?: unknown; errorCode?: string };
+                  }
+                ).eventData;
+                const [runValue] = await tx
+                  .update(Schema.runs)
+                  .set({
+                    status: 'failed',
+                    error: eventData?.error as SerializedData | undefined,
+                    errorCode: eventData?.errorCode,
+                    completedAt: now,
+                    updatedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(Schema.runs.runId, runId),
+                      notInArray(Schema.runs.status, terminalRunStatuses)
+                    )
+                  )
+                  .returning();
+                if (runValue) {
+                  run = deserializeRunError(compact(runValue));
+                } else {
+                  const [existing] = await tx
+                    .select({ status: Schema.runs.status })
+                    .from(Schema.runs)
+                    .where(eq(Schema.runs.runId, runId))
+                    .limit(1);
+                  if (!existing) {
+                    throw new WorkflowRunNotFoundError(runId);
+                  }
+                  if (isTerminalWorkflowRunStatus(existing.status)) {
+                    throw new EntityConflictError(
+                      `Cannot transition run from terminal state "${existing.status}"`
+                    );
+                  }
+                }
+              }
+              await Promise.all([
+                tx.delete(Schema.hooks).where(eq(Schema.hooks.runId, runId)),
+                tx.delete(Schema.waits).where(eq(Schema.waits.runId, runId)),
+              ]);
+              const event = await insertEvent(
+                op.req,
+                (op.req as { eventData?: unknown }).eventData
+              );
+              results[op.index] = run ? { event, run } : { event };
+              break;
+            }
           }
         }
 
@@ -2110,10 +2555,11 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         // Advance the fence: bump runVersion to expectedRunVersion + 1 (the
         // server's contract) and record lastBatchId, conditional on the version
         // we locked — a 0-row result means a concurrent advance slipped in and
-        // the whole batch rolls back. Skipped for an already-applied retry (the
-        // run is already at the post-batch version). v2 only.
+        // the whole batch rolls back. Unconditional when fenced: an
+        // already-applied retry returned early via the whole-batch short-circuit
+        // above (it never reaches here). v2 only.
         let newRunVersion: number | undefined = currentRunVersion;
-        if (fenced && !alreadyApplied) {
+        if (fenced) {
           const [updated] = await tx
             .update(Schema.runs)
             .set({

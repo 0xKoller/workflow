@@ -266,33 +266,42 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
     expect(stepMSecond.status).toBe('running');
   });
 
-  it('is all-or-nothing: a failure mid-batch rolls back every prior write in the tx', async () => {
+  it('is all-or-nothing: a mid-tx conflict rolls back every prior write in the same tx', async () => {
     const runId = await freshRun();
     await bornRun(runId, 'stepN', new Uint8Array([0]));
+    // Pre-existing wait: a later batch frame that re-creates it will conflict
+    // mid-transaction (the whole-batch short-circuit only covers same-batchId
+    // retries, so a genuine collision here rolls back all-or-nothing).
+    await events.create(runId, {
+      eventType: 'wait_created',
+      specVersion: SPEC_VERSION_CURRENT,
+      correlationId: 'wDup',
+      eventData: { resumeAt: new Date(Date.now() + 60_000) },
+    } as CreateEventRequest);
     const before = await listEvents(runId);
 
-    // A valid transition followed by an unsupported event: the unsupported
-    // frame throws, and the single Postgres transaction must roll back the
-    // completed(N) update and the born-running M insert with it.
+    // A valid completion + born-running create, THEN a wait_created for the
+    // already-existing wait: the wait op throws EntityConflictError, and the
+    // single Postgres transaction must roll back completed(N) and the M insert.
     await expect(
-      events.createBatch(runId, [
-        completedFrame('stepN', new Uint8Array([9])),
-        createdFrame('stepM', 'step-m', new Uint8Array([1, 2, 3])),
-        startedFrame('stepM', 'step-m'),
-        {
-          eventType: 'run_completed',
-          specVersion: SPEC_VERSION_CURRENT,
-          eventData: {},
-        } as CreateEventRequest,
-      ])
-    ).rejects.toBeInstanceOf(WorkflowWorldError);
+      events.createBatch(
+        runId,
+        [
+          completedFrame('stepN', new Uint8Array([9])),
+          createdFrame('stepM', 'step-m', new Uint8Array([1, 2, 3])),
+          startedFrame('stepM', 'step-m'),
+          waitCreatedFrame('wDup', new Date(Date.now() + 60_000)),
+        ],
+        { expectedRunVersion: 0, batchId: 'bat_rollback' }
+      )
+    ).rejects.toBeInstanceOf(EntityConflictError);
 
-    // N was NOT completed, M was NOT created, and no new events were written.
-    const stepN = await steps.get(runId, 'stepN');
-    expect(stepN.status).toBe('running');
+    // N still running, M never created, no new events, version NOT advanced.
+    expect((await steps.get(runId, 'stepN')).status).toBe('running');
     await expect(steps.get(runId, 'stepM')).rejects.toThrow();
     const after = await listEvents(runId);
     expect(after.map((e) => e.eventId)).toEqual(before.map((e) => e.eventId));
+    expect((await runFence(runId)).run_version).toBe(0);
   });
 
   it('rejects empty batch and missing runId', async () => {
@@ -454,7 +463,8 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
     expect(first.runVersion).toBe(1);
     const afterFirst = await listEvents(runId);
 
-    // Redeliver the SAME batchId — the per-frame loop re-runs read-only.
+    // Redeliver the SAME batchId — the whole-batch short-circuit returns the
+    // current entities and writes nothing.
     const second = await events.createBatch(runId, frames, {
       expectedRunVersion: 0,
       batchId: 'bat_fanout_wait_dup',
@@ -469,5 +479,118 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
       afterSecond.filter((e) => e.eventType === 'wait_created')
     ).toHaveLength(1);
     expect((await runFence(runId)).run_version).toBe(1);
+  });
+
+  // ---- full v2 suspension grammar (world-local parity) -------------------
+
+  it('collect-mode: a step_failed leading outcome born-runs the next step in one fenced tx', async () => {
+    const runId = await freshRun();
+    await bornRun(runId, 'stepN', new Uint8Array([0]));
+    const batch = await events.createBatch(
+      runId,
+      [
+        {
+          eventType: 'step_failed',
+          specVersion: SPEC_VERSION_CURRENT,
+          correlationId: 'stepN',
+          eventData: { error: new Uint8Array([7, 7]) },
+        } as CreateEventRequest,
+        createdFrame('stepM', 'step-m', new Uint8Array([1, 2, 3])),
+        startedFrame('stepM', 'step-m'),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_failed_lead' }
+    );
+    // N failed, M born-running + stamped, fence advanced once.
+    expect((await steps.get(runId, 'stepN')).status).toBe('failed');
+    expect((await steps.get(runId, 'stepM')).status).toBe('running');
+    expect(batch.results[2].stepCreated).toBe(true);
+    expect(batch.runVersion).toBe(1);
+    const types = (await listEvents(runId)).map((e) => e.eventType);
+    expect(types.filter((t) => t === 'step_failed')).toHaveLength(1);
+  });
+
+  it('collect-mode: a terminal run_completed folds in, completes the run and clears waits', async () => {
+    const runId = await freshRun();
+    // A pre-existing wait must be cleared when the run reaches terminal.
+    await events.create(runId, {
+      eventType: 'wait_created',
+      specVersion: SPEC_VERSION_CURRENT,
+      correlationId: 'wLeftover',
+      eventData: { resumeAt: new Date(Date.now() + 60_000) },
+    } as CreateEventRequest);
+    const batch = await events.createBatch(
+      runId,
+      [
+        createdFrame('stepM', 'step-m', new Uint8Array([1])),
+        startedFrame('stepM', 'step-m'),
+        {
+          eventType: 'run_completed',
+          specVersion: SPEC_VERSION_CURRENT,
+          correlationId: runId,
+          eventData: { output: new Uint8Array([42]) },
+        } as CreateEventRequest,
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_terminal' }
+    );
+    expect(batch.results[1].stepCreated).toBe(true);
+    // Run is terminal, waits/hooks cleared, fence advanced.
+    const { rows: runRows } = await pool.query(
+      'SELECT status FROM workflow.workflow_runs WHERE id = $1',
+      [runId]
+    );
+    expect(runRows[0]?.status).toBe('completed');
+    const { rows: waitRows } = await pool.query(
+      'SELECT count(*)::int AS n FROM workflow.workflow_waits WHERE run_id = $1',
+      [runId]
+    );
+    expect(waitRows[0]?.n).toBe(0);
+    expect(batch.runVersion).toBe(1);
+    const types = (await listEvents(runId)).map((e) => e.eventType);
+    expect(types.filter((t) => t === 'run_completed')).toHaveLength(1);
+  });
+
+  it('collect-mode: a hook_received frame rides the batch (event-only) without an unsupported-type reject', async () => {
+    const runId = await freshRun();
+    const batch = await events.createBatch(
+      runId,
+      [
+        {
+          eventType: 'hook_received',
+          specVersion: SPEC_VERSION_CURRENT,
+          correlationId: 'hookH',
+          eventData: { payload: new Uint8Array([5]) },
+        } as CreateEventRequest,
+        createdFrame('stepM', 'step-m', new Uint8Array([1])),
+        startedFrame('stepM', 'step-m'),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_hook_recv' }
+    );
+    // The step born-runs and the hook_received event is durable.
+    expect(batch.results[2].stepCreated).toBe(true);
+    const types = (await listEvents(runId)).map((e) => e.eventType);
+    expect(types.filter((t) => t === 'hook_received')).toHaveLength(1);
+    expect(batch.runVersion).toBe(1);
+  });
+
+  it('unfenced createBatch rejects the full grammar (a wait) — the v2 fence is required', async () => {
+    const runId = await freshRun();
+    // A fan-out step + wait with NO batchId: the unfenced path is triple-only.
+    await expect(
+      events.createBatch(runId, [
+        createdFrame('stepM', 'step-m', new Uint8Array([1])),
+        startedFrame('stepM', 'step-m'),
+        waitCreatedFrame('wW', new Date(Date.now() + 60_000)),
+      ])
+    ).rejects.toBeInstanceOf(WorkflowWorldError);
+  });
+
+  it('rejects a malformed batch: a step_started not immediately preceded by its step_created', async () => {
+    const runId = await freshRun();
+    await expect(
+      events.createBatch(runId, [startedFrame('stepM', 'step-m')], {
+        expectedRunVersion: 0,
+        batchId: 'bat_malformed',
+      })
+    ).rejects.toBeInstanceOf(WorkflowWorldError);
   });
 });
