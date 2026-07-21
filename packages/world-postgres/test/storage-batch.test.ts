@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
-import { WorkflowWorldError } from '@workflow/errors';
+import { EntityConflictError, WorkflowWorldError } from '@workflow/errors';
 import type { CreateEventRequest, Event, Step } from '@workflow/world';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { Pool } from 'pg';
@@ -295,5 +295,102 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
         createdFrame('stepM', 'step-m', new Uint8Array([1])),
       ])
     ).rejects.toBeInstanceOf(WorkflowWorldError);
+  });
+
+  // ---- v2 suspension-batch fence ----------------------------------------
+
+  const transition = (): CreateEventRequest[] => [
+    completedFrame('stepN', new Uint8Array([9])),
+    createdFrame('stepM', 'step-m', new Uint8Array([1, 2, 3])),
+    startedFrame('stepM', 'step-m'),
+  ];
+
+  const runFence = async (runId: string) => {
+    const { rows } = await pool.query(
+      'SELECT run_version, last_batch_id FROM workflow.workflow_runs WHERE id = $1',
+      [runId]
+    );
+    return rows[0] as {
+      run_version: number | null;
+      last_batch_id: string | null;
+    };
+  };
+
+  it('v2 fence: applies against runVersion 0, advances to 1 in the same tx, records lastBatchId', async () => {
+    const runId = await freshRun();
+    await bornRun(runId, 'stepN', new Uint8Array([0]));
+    const batch = await events.createBatch(runId, transition(), {
+      expectedRunVersion: 0,
+      batchId: 'bat_one',
+    });
+    expect(batch.results[2].stepCreated).toBe(true);
+    expect(batch.runVersion).toBe(1);
+    expect(batch.lastBatchId).toBe('bat_one');
+    const fence = await runFence(runId);
+    expect(fence.run_version).toBe(1);
+    expect(fence.last_batch_id).toBe('bat_one');
+  });
+
+  it('v2 fence: an already-applied batchId is idempotent (no writes, no stepCreated) and echoes the current version', async () => {
+    const runId = await freshRun();
+    await bornRun(runId, 'stepN', new Uint8Array([0]));
+    const frames = transition();
+    const first = await events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_dup',
+    });
+    expect(first.runVersion).toBe(1);
+    const afterFirst = await listEvents(runId);
+
+    // Redeliver the SAME batchId (a transport retry still believing v0).
+    const second = await events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_dup',
+    });
+    expect(second.results[2].stepCreated).toBeUndefined();
+    expect(second.runVersion).toBe(1);
+    expect(second.lastBatchId).toBe('bat_dup');
+    const afterSecond = await listEvents(runId);
+    expect(afterSecond.map((e) => e.eventId)).toEqual(
+      afterFirst.map((e) => e.eventId)
+    );
+    // The version did NOT advance a second time.
+    expect((await runFence(runId)).run_version).toBe(1);
+  });
+
+  it('v2 fence: a run-version mismatch aborts all-or-nothing (EntityConflictError), rolling back every write', async () => {
+    const runId = await freshRun();
+    await bornRun(runId, 'stepN', new Uint8Array([0]));
+    const before = await listEvents(runId);
+    // Run is at version 0; asserting 1 is stale.
+    await expect(
+      events.createBatch(runId, transition(), {
+        expectedRunVersion: 1,
+        batchId: 'bat_stale',
+      })
+    ).rejects.toBeInstanceOf(EntityConflictError);
+    // Nothing written, N still running, M never created, version unchanged.
+    const stepN = await steps.get(runId, 'stepN');
+    expect(stepN.status).toBe('running');
+    await expect(steps.get(runId, 'stepM')).rejects.toThrow();
+    const after = await listEvents(runId);
+    expect(after.map((e) => e.eventId)).toEqual(before.map((e) => e.eventId));
+    expect((await runFence(runId)).run_version).toBe(0);
+  });
+
+  it('v2 fence: a pre-v2 run (run_version NULL) is rejected run-not-versioned', async () => {
+    const runId = await freshRun();
+    await bornRun(runId, 'stepN', new Uint8Array([0]));
+    // Simulate a run created before the fence.
+    await pool.query(
+      'UPDATE workflow.workflow_runs SET run_version = NULL WHERE id = $1',
+      [runId]
+    );
+    await expect(
+      events.createBatch(runId, transition(), {
+        expectedRunVersion: 0,
+        batchId: 'bat_prev2',
+      })
+    ).rejects.toMatchObject({ code: 'run-not-versioned', status: 409 });
   });
 });

@@ -429,6 +429,9 @@ const attributeToDisplayFn: Record<
   projectId: (_value: unknown) => null,
   environment: (_value: unknown) => null,
   executionContext: (_value: unknown) => null,
+  // v2 suspension-batch fence — internal World bookkeeping, not surfaced.
+  runVersion: (_value: unknown) => null,
+  lastBatchId: (_value: unknown) => null,
   // Attributes — string-string metadata attached to the run.
   // Rendered as key-value rows in its own collapsible section;
   // if empty/missing, hidden by the hasDisplayContent gate.

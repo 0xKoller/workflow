@@ -548,6 +548,8 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
                   | undefined,
                 attributes: runInputData.attributes,
                 status: 'pending',
+                // v2 suspension-batch fence (see run_created above).
+                runVersion: 0,
               })
               .onConflictDoNothing()
               .returning();
@@ -818,6 +820,10 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               | undefined,
             attributes: eventData.attributes,
             status: 'pending',
+            // v2 suspension-batch fence: a run created under v2 starts at
+            // version 0 so createBatch can assert + advance it. NULL marks a
+            // pre-v2 run (the runtime latches batching off).
+            runVersion: 0,
           })
           .onConflictDoNothing()
           .returning();
@@ -1808,6 +1814,55 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         // from it lost the race / was already applied (stepCreated omitted).
         const bornRunning = new Set<string>();
 
+        // v2 suspension-batch fence. Present iff the caller supplies a batchId
+        // (the runtime always does for a v2 run); a fence-less caller keeps the
+        // exact v1 behavior. Lock the run row FOR UPDATE so the version check
+        // and the advance below are a genuine CAS within this transaction.
+        const batchId = params?.batchId;
+        const expectedRunVersion = params?.expectedRunVersion;
+        const fenced = batchId !== undefined;
+        let alreadyApplied = false;
+        let currentRunVersion: number | undefined;
+        if (fenced) {
+          const [runRow] = await tx
+            .select({
+              runVersion: Schema.runs.runVersion,
+              lastBatchId: Schema.runs.lastBatchId,
+            })
+            .from(Schema.runs)
+            .where(eq(Schema.runs.runId, runId))
+            .limit(1)
+            .for('update');
+          if (!runRow) {
+            throw new WorkflowWorldError(
+              `world-postgres: run "${runId}" not found`,
+              { status: 404 }
+            );
+          }
+          currentRunVersion = runRow.runVersion ?? undefined;
+          if (currentRunVersion === undefined) {
+            // Pre-v2 run: reject with a distinct code so the client latches
+            // batching off permanently for this run.
+            throw new WorkflowWorldError(
+              'world-postgres: run predates the suspension-batch fence (no runVersion)',
+              { status: 409, code: 'run-not-versioned' }
+            );
+          }
+          if (runRow.lastBatchId === batchId) {
+            // Idempotent already-applied: the SAME batch committed earlier. The
+            // per-frame loop below runs read-only (every write is skipped as a
+            // duplicate) and the version advance is skipped.
+            alreadyApplied = true;
+          } else if (expectedRunVersion !== currentRunVersion) {
+            // Optimistic-concurrency fence: a different write advanced the run.
+            // Abort all-or-nothing (rolls back) — the client abandons the
+            // deferred completion and re-derives from a fresh replay.
+            throw new EntityConflictError(
+              `world-postgres: suspension-batch run-version conflict (expected ${expectedRunVersion}, run at ${currentRunVersion})`
+            );
+          }
+        }
+
         // Insert one event row on `tx` and return the hydrated Event, mirroring
         // the single-path result construction (see the create() tail above).
         const insertEvent = async (
@@ -2018,7 +2073,44 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
           hasMore = rows.length > limit;
         }
 
-        return { results, events: deltaEvents, cursor, hasMore };
+        // Advance the fence: bump runVersion to expectedRunVersion + 1 (the
+        // server's contract) and record lastBatchId, conditional on the version
+        // we locked — a 0-row result means a concurrent advance slipped in and
+        // the whole batch rolls back. Skipped for an already-applied retry (the
+        // run is already at the post-batch version). v2 only.
+        let newRunVersion: number | undefined = currentRunVersion;
+        if (fenced && !alreadyApplied) {
+          const [updated] = await tx
+            .update(Schema.runs)
+            .set({
+              runVersion: (expectedRunVersion as number) + 1,
+              lastBatchId: batchId,
+            })
+            .where(
+              and(
+                eq(Schema.runs.runId, runId),
+                eq(Schema.runs.runVersion, expectedRunVersion as number)
+              )
+            )
+            .returning({ runVersion: Schema.runs.runVersion });
+          if (!updated) {
+            throw new EntityConflictError(
+              'world-postgres: suspension-batch run-version conflict on advance'
+            );
+          }
+          newRunVersion =
+            updated.runVersion ?? (expectedRunVersion as number) + 1;
+        }
+
+        return {
+          results,
+          events: deltaEvents,
+          cursor,
+          hasMore,
+          ...(fenced
+            ? { runVersion: newRunVersion, lastBatchId: batchId }
+            : {}),
+        };
       });
     },
     async get(

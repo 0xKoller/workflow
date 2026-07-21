@@ -113,6 +113,17 @@ export const runs = schema.table(
     completedAt: timestamp('completed_at'),
     startedAt: timestamp('started_at'),
     expiredAt: timestamp('expired_at'),
+    /**
+     * v2 suspension-batch fence: the per-run monotonic version createBatch
+     * asserts and advances (run_created seeds 0). NULL on runs created before
+     * v2, which is what marks a run ineligible for batching.
+     */
+    runVersion: integer('run_version'),
+    /**
+     * v2 idempotency key of the last suspension batch applied to this run; a
+     * retried batch whose batchId equals this resolves as already-applied.
+     */
+    lastBatchId: varchar('last_batch_id'),
   } satisfies DrizzlishOfType<
     Cborized<
       Omit<WorkflowRun, 'input'> & { input?: unknown },
