@@ -10,6 +10,8 @@ import {
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  BatchEventResult,
+  CreateEventRequest,
   Event,
   EventResult,
   Hook,
@@ -604,7 +606,7 @@ export function createEventsStorage(
   const stepLocks = new Map<string, Promise<unknown>>();
   const hookLocks = new Map<string, Promise<unknown>>();
 
-  return {
+  const eventsStore: LocalEventsStorage = {
     clearCache,
     async create(runId, data, params): Promise<EventResult> {
       // Validate request-supplied IDs before they're concatenated into
@@ -2296,6 +2298,159 @@ export function createEventsStorage(
       } // end createImpl
     },
 
+    /**
+     * Batch step transition (WORKFLOW_BATCH_TRANSITIONS). Applies the ordered
+     * transition [step_completed(N), step_created(N+1), step_started(N+1)] for
+     * one run — the same shape workflow-server#646 commits atomically over HTTP.
+     *
+     * Composition over reimplementation: the transition is exactly "complete
+     * step N, then born-run step N+1", and the single-`create` path already has
+     * a battle-tested born-running fold (the lazy `step_started` that carries
+     * the step-creation `input`: it writes the step entity, a synthetic
+     * `step_created` event, transitions to running, and stamps `stepCreated` on
+     * the create-claim winner). So `createBatch` drives `create` twice —
+     * `step_completed(N)` then a lazy born-running `step_started(N+1)` — which
+     * makes the durable state BYTE-IDENTICAL to what the kill-switch (two-POST)
+     * path produces, the strongest guarantee for a default-on change.
+     *
+     * Atomicity note (honest for a filesystem World): world-local has no
+     * cross-entity transaction. Causal order `completed(N) < created(N+1)`
+     * (the B2 invariant) is load-bearing and REQUIRES completing N before
+     * creating N+1, so the born-run's create-claim is necessarily acquired
+     * after `completed(N)` is durable — genuine all-or-nothing and causal
+     * ordering can't both hold on a plain FS. We therefore peek first: if
+     * step N+1 is already born-running (idempotent retry / concurrent
+     * double-delivery) we write NOTHING and return current entities without
+     * `stepCreated`. The only non-atomic window left — a second writer
+     * born-running N+1 in the gap after the peek — cannot occur in world-local's
+     * single-process / dev-only model, and even if it did the outcome
+     * (`completed(N)` durable, EntityConflictError surfaced) is identical to the
+     * single-event path's lost-claim behavior, which the client already handles
+     * by reinvoking. The inline delta is deliberately omitted; the client
+     * reloads events when `events` is absent, a cheap local query here.
+     */
+    async createBatch(runId, batchEvents): Promise<BatchEventResult> {
+      if (!runId) {
+        throw new WorkflowWorldError(
+          'world-local: createBatch requires a runId'
+        );
+      }
+      if (!batchEvents || batchEvents.length === 0) {
+        throw new WorkflowWorldError(
+          'world-local: createBatch requires at least one event'
+        );
+      }
+      assertSafeEntityId('runId', runId);
+      for (const ev of batchEvents) {
+        if (typeof ev.correlationId === 'string') {
+          assertSafeEntityId('correlationId', ev.correlationId);
+        }
+      }
+
+      const completedReq = batchEvents.find(
+        (e) => e.eventType === 'step_completed'
+      );
+      const createdReq = batchEvents.find(
+        (e) => e.eventType === 'step_created'
+      );
+      const startedReq = batchEvents.find(
+        (e) => e.eventType === 'step_started'
+      );
+      // Only the [step_completed?, step_created, step_started] transition the
+      // runtime batches is supported; anything else is a caller bug.
+      if (
+        !createdReq ||
+        !startedReq ||
+        createdReq.correlationId !== startedReq.correlationId ||
+        batchEvents.some(
+          (e) =>
+            e.eventType !== 'step_completed' &&
+            e.eventType !== 'step_created' &&
+            e.eventType !== 'step_started'
+        )
+      ) {
+        throw new WorkflowWorldError(
+          'world-local: createBatch only supports the [step_completed, step_created, step_started] step transition'
+        );
+      }
+
+      // Batch results always resolve their payloads (mirrors world-vercel's
+      // createBatch and the single-create default); CreateBatchParams carries no
+      // resolveData knob.
+      const resolveData = DEFAULT_RESOLVE_DATA_OPTION;
+      const mStepId = createdReq.correlationId as string;
+
+      // Idempotent / already-applied: if step N+1 is already born-running, the
+      // whole transition committed earlier. Write nothing; return the current
+      // entities WITHOUT `stepCreated` so the client re-derives from a fresh
+      // replay instead of double-running the body.
+      const existingM = await readJSONWithFallback(
+        basedir,
+        'steps',
+        `${runId}-${mStepId}`,
+        StepSchema,
+        tag
+      );
+      if (
+        existingM &&
+        (existingM.status === 'running' ||
+          isTerminalStepStatus(existingM.status))
+      ) {
+        const results: EventResult[] = [];
+        if (completedReq) {
+          const nStep = await readJSONWithFallback(
+            basedir,
+            'steps',
+            `${runId}-${completedReq.correlationId}`,
+            StepSchema,
+            tag
+          );
+          results.push(nStep ? { step: nStep } : {});
+        }
+        results.push({ step: existingM });
+        results.push({ step: existingM });
+        return { results };
+      }
+
+      // 1. Complete step N first — preserves causal order completed(N) < the
+      //    N+1 create below.
+      let completedResult: EventResult | undefined;
+      if (completedReq) {
+        completedResult = await eventsStore.create(runId, completedReq, {
+          resolveData,
+        });
+      }
+
+      // 2. Born-run step N+1 by folding create + start into a lazy step_started
+      //    that carries the step-creation input. Reuses the single-path
+      //    born-running write sequence and its `stepCreated` create-claim stamp.
+      //    A lost create-claim (concurrent born-run) surfaces as
+      //    EntityConflictError, which the client maps to reinvoke — the same as
+      //    the single-event path.
+      const lazyStarted = {
+        ...startedReq,
+        eventData: {
+          ...(startedReq.eventData as Record<string, unknown>),
+          input: (createdReq.eventData as { input: unknown }).input,
+        },
+      } as CreateEventRequest;
+      const startedResult = await eventsStore.create(runId, lazyStarted, {
+        resolveData,
+      });
+
+      // 3. One result per input event, in request order. The runtime reads only
+      //    the LAST (started) result — for the born-running step entity and the
+      //    `stepCreated` signal. The created-frame result is synthesized from
+      //    the same entity (the client does not inspect it).
+      const results: EventResult[] = [];
+      if (completedResult) {
+        results.push(completedResult);
+      }
+      results.push({ step: startedResult.step });
+      results.push(startedResult);
+      return { results };
+    },
+
     async get(runId, eventId, params) {
       assertSafeEntityId('runId', runId);
       assertSafeEntityId('eventId', eventId);
@@ -2377,4 +2532,6 @@ export function createEventsStorage(
       return result;
     },
   };
+
+  return eventsStore;
 }
