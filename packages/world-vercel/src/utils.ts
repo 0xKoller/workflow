@@ -31,8 +31,18 @@ import { version } from './version.js';
  * Inline workflow-server URL override. Must remain an empty string on
  * `main` — rewritten by external CI for branch-deployment testing.
  * Prefer `VERCEL_WORKFLOW_SERVER_URL` for deployment-time configuration.
+ *
+ * INTENTIONAL REVIEW-TIME PIN (do not merge with this set): points the
+ * world-vercel HTTP client at the workflow-server#646 preview deployment
+ * (head a588ed3d) so this PR's e2e/integration lanes exercise the real
+ * batched `POST /api/v4/runs/:runId/events/batch` backend before #646 is
+ * promoted to production. The CI lint rule that requires this constant to
+ * be empty on `main` will FAIL while this pin is present — that failure is
+ * the deliberate merge gate, not a bug to work around. Removal is a
+ * single-line revert to `''` once #646 ships to production.
  */
-export const WORKFLOW_SERVER_URL_OVERRIDE = '';
+export const WORKFLOW_SERVER_URL_OVERRIDE =
+  'https://workflow-server-8sp9l2esp.vercel.sh';
 
 /**
  * HTTP methods that are safe to transparently re-issue inside the adapter.
