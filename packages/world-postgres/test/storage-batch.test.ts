@@ -53,6 +53,16 @@ const startedFrame = (stepId: string, stepName: string): CreateEventRequest =>
     eventData: { stepName },
   }) as CreateEventRequest;
 
+// A fan-out `wait_created` frame (collect-mode folds these alongside the
+// suspension's steps).
+const waitCreatedFrame = (waitId: string, resumeAt: Date): CreateEventRequest =>
+  ({
+    eventType: 'wait_created',
+    specVersion: SPEC_VERSION_CURRENT,
+    correlationId: waitId,
+    eventData: { resumeAt },
+  }) as CreateEventRequest;
+
 // Non-deterministic fields (ids / timestamps) differ across two structurally
 // equivalent runs; project onto meaningful content.
 const projectEvent = (e: Event) => ({
@@ -82,7 +92,7 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
 
   async function truncateTables() {
     await pool.query(
-      'TRUNCATE TABLE workflow.workflow_events, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_runs RESTART IDENTITY CASCADE'
+      'TRUNCATE TABLE workflow.workflow_events, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_waits, workflow.workflow_runs RESTART IDENTITY CASCADE'
     );
   }
 
@@ -392,5 +402,72 @@ describe('world-postgres events.createBatch (Postgres integration)', () => {
         batchId: 'bat_prev2',
       })
     ).rejects.toMatchObject({ code: 'run-not-versioned', status: 409 });
+  });
+
+  // ---- collect-mode fan-out grammar (steps + wait in one batch) ----------
+
+  it('collect-mode: folds a two-step fan-out plus a wait into one fenced tx', async () => {
+    const runId = await freshRun();
+    const resumeAt = new Date(Date.now() + 60_000);
+    const batch = await events.createBatch(
+      runId,
+      [
+        createdFrame('fA', 'step-a', new Uint8Array([1])),
+        startedFrame('fA', 'step-a'),
+        createdFrame('fB', 'step-b', new Uint8Array([2])),
+        startedFrame('fB', 'step-b'),
+        waitCreatedFrame('wW', resumeAt),
+      ],
+      { expectedRunVersion: 0, batchId: 'bat_fanout_wait' }
+    );
+    // Both inline steps born-running + stamped; the wait frame recorded.
+    expect(batch.results).toHaveLength(5);
+    expect(batch.results[1].stepCreated).toBe(true);
+    expect(batch.results[3].stepCreated).toBe(true);
+    expect((await steps.get(runId, 'fA')).status).toBe('running');
+    expect((await steps.get(runId, 'fB')).status).toBe('running');
+    // The wait entity exists and its wait_created event is durable.
+    const { rows: waitRows } = await pool.query(
+      'SELECT status FROM workflow.workflow_waits WHERE wait_id = $1',
+      [`${runId}-wW`]
+    );
+    expect(waitRows[0]?.status).toBe('waiting');
+    const types = (await listEvents(runId)).map((e) => e.eventType);
+    expect(types.filter((t) => t === 'wait_created')).toHaveLength(1);
+    // Fence advanced exactly once for the whole fan-out.
+    expect(batch.runVersion).toBe(1);
+    expect((await runFence(runId)).run_version).toBe(1);
+  });
+
+  it('collect-mode: an already-applied fan-out+wait batch writes no duplicate wait event and does not re-advance', async () => {
+    const runId = await freshRun();
+    const resumeAt = new Date(Date.now() + 60_000);
+    const frames = [
+      createdFrame('gA', 'step-a', new Uint8Array([1])),
+      startedFrame('gA', 'step-a'),
+      waitCreatedFrame('gW', resumeAt),
+    ];
+    const first = await events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_fanout_wait_dup',
+    });
+    expect(first.runVersion).toBe(1);
+    const afterFirst = await listEvents(runId);
+
+    // Redeliver the SAME batchId — the per-frame loop re-runs read-only.
+    const second = await events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_fanout_wait_dup',
+    });
+    expect(second.runVersion).toBe(1);
+    const afterSecond = await listEvents(runId);
+    // No duplicate wait_created (or any) event, and no second version advance.
+    expect(afterSecond.map((e) => e.eventId)).toEqual(
+      afterFirst.map((e) => e.eventId)
+    );
+    expect(
+      afterSecond.filter((e) => e.eventType === 'wait_created')
+    ).toHaveLength(1);
+    expect((await runFence(runId)).run_version).toBe(1);
   });
 });

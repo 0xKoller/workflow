@@ -2037,7 +2037,41 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
               const existing = await readStep(correlationId);
               results.push(existing ? { step: existing } : {});
             }
+          } else if (data.eventType === 'wait_created') {
+            // Fan-out wait folded into the batch (collect-mode). Create the wait
+            // entity; write its event only on a FRESH apply. The event insert is
+            // gated on the entity insert succeeding AND !alreadyApplied so an
+            // idempotent same-batchId retry (whose per-frame loop re-runs
+            // read-only) never mints a duplicate wait_created — unlike the
+            // single-event path, an already-present wait here is idempotent
+            // success, not an EntityConflictError.
+            const eventData = (data as { eventData?: { resumeAt?: Date } })
+              .eventData;
+            const waitId = `${runId}-${correlationId}`;
+            const [inserted] = await tx
+              .insert(Schema.waits)
+              .values({
+                waitId,
+                runId,
+                status: 'waiting',
+                resumeAt: eventData?.resumeAt,
+                specVersion: data.specVersion ?? SPEC_VERSION_CURRENT,
+              })
+              .onConflictDoNothing()
+              .returning();
+            if (inserted && !alreadyApplied) {
+              const event = await insertEvent(data, eventData);
+              results.push({ event });
+            } else {
+              results.push({});
+            }
           } else {
+            // hook_received / wait_completed / terminal (run_completed|
+            // run_failed) are part of the server grammar but the runtime's
+            // collect-mode does not emit them in a batch today (hook_received is
+            // gated off; wait_completed is the elapsed-wait path; terminal folds
+            // on the completion path — all documented follow-ups). Reject rather
+            // than half-implement an untested branch.
             throw new WorkflowWorldError(
               `world-postgres: createBatch does not support event type "${data.eventType}"`
             );
