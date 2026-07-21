@@ -80,6 +80,16 @@ export const WorkflowRunBaseSchema = z.object({
    * immutable, so every invocation re-derives the same decision).
    */
   runVersion: z.number().optional(),
+  /**
+   * v2 idempotency key of the last suspension batch applied to this run. A
+   * World records the request's `batchId` here as part of the batch's atomic
+   * commit; a retried/redelivered batch whose `batchId` equals this resolves as
+   * already-applied (writes nothing, returns the current entities). Internal
+   * World bookkeeping — the runtime never reads it (it derives idempotency from
+   * the runVersion fence and the per-frame stepCreated signal). Absent until a
+   * v2 batch has been applied, and on Worlds that don't implement the fence.
+   */
+  lastBatchId: z.string().optional(),
   executionContext: z.record(z.string(), z.any()).optional(),
   input: SerializedDataSchema.optional(),
   output: SerializedDataSchema.optional(),

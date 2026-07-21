@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { WorkflowWorldError } from '@workflow/errors';
+import { EntityConflictError, WorkflowWorldError } from '@workflow/errors';
 import type { CreateEventRequest, Event, Step, Storage } from '@workflow/world';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -251,5 +251,86 @@ describe('world-local events.createBatch', () => {
         startedFrame('stepM', 'step-m'),
       ])
     ).rejects.toBeInstanceOf(WorkflowWorldError);
+  });
+
+  // ---- v2 suspension-batch fence ----------------------------------------
+
+  const transition = (): CreateEventRequest[] => [
+    completedFrame('stepN', new Uint8Array([9])),
+    createdFrame('stepM', 'step-m', new Uint8Array([1, 2, 3])),
+    startedFrame('stepM', 'step-m'),
+  ];
+
+  it('v2 fence: applies against runVersion 0, advances to 1, records lastBatchId, stamps stepCreated', async () => {
+    const runId = await freshRunWithStepN();
+    const batch = await storage.events.createBatch(runId, transition(), {
+      expectedRunVersion: 0,
+      batchId: 'bat_one',
+    });
+    expect(batch.results[2].stepCreated).toBe(true);
+    // The run's version advanced to expected + 1, and lastBatchId was recorded.
+    expect(batch.runVersion).toBe(1);
+    expect(batch.lastBatchId).toBe('bat_one');
+    const run = await storage.runs.get(runId);
+    expect(run.runVersion).toBe(1);
+    expect(run.lastBatchId).toBe('bat_one');
+  });
+
+  it('v2 fence: an already-applied batchId is idempotent (no writes, no stepCreated) and echoes the current version', async () => {
+    const runId = await freshRunWithStepN();
+    const frames = transition();
+    const first = await storage.events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_dup',
+    });
+    expect(first.runVersion).toBe(1);
+    const eventsAfterFirst = await listEvents(storage, runId);
+
+    // Re-deliver the SAME batchId. Even though the client (a transport retry)
+    // still believes the run is at version 0, lastBatchId short-circuits it.
+    const second = await storage.events.createBatch(runId, frames, {
+      expectedRunVersion: 0,
+      batchId: 'bat_dup',
+    });
+    expect(second.results[2].stepCreated).toBeUndefined();
+    expect(second.runVersion).toBe(1);
+    expect(second.lastBatchId).toBe('bat_dup');
+    const eventsAfterSecond = await listEvents(storage, runId);
+    expect(eventsAfterSecond.map((e) => e.eventId)).toEqual(
+      eventsAfterFirst.map((e) => e.eventId)
+    );
+  });
+
+  it('v2 fence: a run-version mismatch aborts all-or-nothing with EntityConflictError and writes nothing', async () => {
+    const runId = await freshRunWithStepN();
+    const before = await listEvents(storage, runId);
+    // The run is at version 0; asserting 1 is stale.
+    await expect(
+      storage.events.createBatch(runId, transition(), {
+        expectedRunVersion: 1,
+        batchId: 'bat_stale',
+      })
+    ).rejects.toBeInstanceOf(EntityConflictError);
+    // Nothing written; stepM never born.
+    const after = await listEvents(storage, runId);
+    expect(after.map((e) => e.eventId)).toEqual(before.map((e) => e.eventId));
+    await expect(storage.steps.get(runId, 'stepM')).rejects.toBeTruthy();
+    const run = await storage.runs.get(runId);
+    expect(run.runVersion).toBe(0);
+  });
+
+  it('v2 fence: a pre-v2 run (no runVersion) is rejected run-not-versioned', async () => {
+    const runId = await freshRunWithStepN();
+    // Simulate a run created before the fence: strip runVersion from disk.
+    const runFile = path.join(testDir, 'runs', `${runId}.json`);
+    const raw = JSON.parse(await fs.readFile(runFile, 'utf8'));
+    delete raw.runVersion;
+    await fs.writeFile(runFile, JSON.stringify(raw));
+    await expect(
+      storage.events.createBatch(runId, transition(), {
+        expectedRunVersion: 0,
+        batchId: 'bat_prev2',
+      })
+    ).rejects.toMatchObject({ code: 'run-not-versioned', status: 409 });
   });
 });

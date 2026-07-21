@@ -770,6 +770,10 @@ export function createEventsStorage(
                 attributes: runInputData.attributes ?? {},
                 createdAt: now,
                 updatedAt: now,
+                // v2 suspension-batch fence: a run created under v2 starts at
+                // version 0 so createBatch can assert + advance it. Its absence
+                // is what marks a pre-v2 run (the runtime latches batching off).
+                runVersion: 0,
               };
               const runPath = taggedPath(basedir, 'runs', effectiveRunId, tag);
               const created = await writeExclusive(
@@ -1095,6 +1099,10 @@ export function createEventsStorage(
             attributes: runData.attributes ?? {},
             createdAt: now,
             updatedAt: now,
+            // v2 suspension-batch fence: a run created under v2 starts at
+            // version 0 so createBatch can assert + advance it. Its absence
+            // marks a pre-v2 run (the runtime latches batching off).
+            runVersion: 0,
           };
           // Atomically publish the run entity file without overwriting an
           // existing winner. This prevents a TOCTOU race with the resilient
@@ -2329,7 +2337,7 @@ export function createEventsStorage(
      * by reinvoking. The inline delta is deliberately omitted; the client
      * reloads events when `events` is absent, a cheap local query here.
      */
-    async createBatch(runId, batchEvents): Promise<BatchEventResult> {
+    async createBatch(runId, batchEvents, params): Promise<BatchEventResult> {
       if (!runId) {
         throw new WorkflowWorldError(
           'world-local: createBatch requires a runId'
@@ -2380,6 +2388,81 @@ export function createEventsStorage(
       const resolveData = DEFAULT_RESOLVE_DATA_OPTION;
       const mStepId = createdReq.correlationId as string;
 
+      // v2 suspension-batch fence. Present iff the caller supplies a batchId
+      // (the runtime always does for a v2 run); a fence-less caller (direct
+      // tests, legacy) keeps the exact v1 behavior below. The version CAS is a
+      // lock-free read here — genuine cross-transaction atomicity isn't
+      // available on a plain FS (see the atomicity note above); world-local's
+      // single-process/dev model makes the read-modify-advance race unreachable,
+      // and the durable step create-claim remains the hard exactly-once gate.
+      const batchId = params?.batchId;
+      const expectedRunVersion = params?.expectedRunVersion;
+      const fenced = batchId !== undefined;
+
+      // Materialize the transition's current entities for an idempotent /
+      // already-applied return (no writes, no stepCreated).
+      const currentTransitionResults = async (): Promise<EventResult[]> => {
+        const out: EventResult[] = [];
+        if (completedReq) {
+          const nStep = await readJSONWithFallback(
+            basedir,
+            'steps',
+            `${runId}-${completedReq.correlationId}`,
+            StepSchema,
+            tag
+          );
+          out.push(nStep ? { step: nStep } : {});
+        }
+        const mStep = await readJSONWithFallback(
+          basedir,
+          'steps',
+          `${runId}-${mStepId}`,
+          StepSchema,
+          tag
+        );
+        out.push(mStep ? { step: mStep } : {});
+        out.push(mStep ? { step: mStep } : {});
+        return out;
+      };
+
+      let fenceRun: WorkflowRun | null = null;
+      if (fenced) {
+        fenceRun = await readJSON(
+          taggedPath(basedir, 'runs', runId, tag),
+          WorkflowRunSchema
+        );
+        if (!fenceRun) {
+          throw new WorkflowRunNotFoundError(runId);
+        }
+        // Pre-v2 run: no version to fence against. Reject with a distinct code
+        // so the client latches batching off permanently for this run.
+        if (fenceRun.runVersion === undefined) {
+          throw new WorkflowWorldError(
+            'world-local: run predates the suspension-batch fence (no runVersion)',
+            { status: 409, code: 'run-not-versioned' }
+          );
+        }
+        // Idempotent already-applied: the SAME batch committed earlier (a
+        // transport retry / redelivery). Return the current entities without
+        // stepCreated; write nothing.
+        if (fenceRun.lastBatchId === batchId) {
+          return {
+            results: await currentTransitionResults(),
+            runVersion: fenceRun.runVersion,
+            lastBatchId: batchId,
+          };
+        }
+        // Optimistic-concurrency fence: a different write advanced the run since
+        // the client's snapshot. Abort all-or-nothing (EntityConflictError → the
+        // client abandons the deferred completion and re-derives from a fresh
+        // replay), mirroring the server's 409 suspension-batch-conflict.
+        if (expectedRunVersion !== fenceRun.runVersion) {
+          throw new EntityConflictError(
+            `world-local: suspension-batch run-version conflict (expected ${expectedRunVersion}, run at ${fenceRun.runVersion})`
+          );
+        }
+      }
+
       // Idempotent / already-applied: if step N+1 is already born-running, the
       // whole transition committed earlier. Write nothing; return the current
       // entities WITHOUT `stepCreated` so the client re-derives from a fresh
@@ -2396,20 +2479,10 @@ export function createEventsStorage(
         (existingM.status === 'running' ||
           isTerminalStepStatus(existingM.status))
       ) {
-        const results: EventResult[] = [];
-        if (completedReq) {
-          const nStep = await readJSONWithFallback(
-            basedir,
-            'steps',
-            `${runId}-${completedReq.correlationId}`,
-            StepSchema,
-            tag
-          );
-          results.push(nStep ? { step: nStep } : {});
-        }
-        results.push({ step: existingM });
-        results.push({ step: existingM });
-        return { results };
+        const results = await currentTransitionResults();
+        return fenced
+          ? { results, runVersion: fenceRun?.runVersion, lastBatchId: batchId }
+          : { results };
       }
 
       // 1. Complete step N first — preserves causal order completed(N) < the
@@ -2438,7 +2511,27 @@ export function createEventsStorage(
         resolveData,
       });
 
-      // 3. One result per input event, in request order. The runtime reads only
+      // 3. Advance the fence: bump runVersion to expectedRunVersion + 1 (the
+      //    server's contract) and record lastBatchId, under the run lock so the
+      //    write merges the freshest attributes. v2 only.
+      let newRunVersion: number | undefined;
+      if (fenced) {
+        newRunVersion = (expectedRunVersion as number) + 1;
+        await withRunFileLock(runId, async () => {
+          const fresh = await readJSON(
+            taggedPath(basedir, 'runs', runId, tag),
+            WorkflowRunSchema
+          );
+          const base = fresh ?? (fenceRun as WorkflowRun);
+          await writeJSON(
+            taggedPath(basedir, 'runs', runId, tag),
+            { ...base, runVersion: newRunVersion, lastBatchId: batchId },
+            { overwrite: true }
+          );
+        });
+      }
+
+      // 4. One result per input event, in request order. The runtime reads only
       //    the LAST (started) result — for the born-running step entity and the
       //    `stepCreated` signal. The created-frame result is synthesized from
       //    the same entity (the client does not inspect it).
@@ -2448,7 +2541,9 @@ export function createEventsStorage(
       }
       results.push({ step: startedResult.step });
       results.push(startedResult);
-      return { results };
+      return fenced
+        ? { results, runVersion: newRunVersion, lastBatchId: batchId }
+        : { results };
     },
 
     async get(runId, eventId, params) {
