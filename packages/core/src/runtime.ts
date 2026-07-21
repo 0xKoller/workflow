@@ -1824,26 +1824,46 @@ export function workflowEntrypoint(
                           !batchDisabledForRun &&
                           !turbo &&
                           err.attributeCount === 0 &&
-                          // No hook creation this suspension and none open in the
-                          // run: keeps the whole hook / hook_received /
-                          // optimistic-start interaction off the batch path (a
-                          // hook-creating suspension also sets hasAwaitedHookCreation
-                          // which empties lazyInlineSteps and needs an immediate
-                          // replay). `hook_received` batching is a documented
-                          // follow-up; the handler buffers it but it never occurs
-                          // under this gate.
+                          // Keep the whole hook / hook_received / optimistic-start
+                          // interaction off the batch path. THREE distinct terms are
+                          // required because a hook can escape any one of them:
+                          //   - `hookCount === 0`: no hook CREATED this suspension (a
+                          //     hook-creating suspension also sets
+                          //     hasAwaitedHookCreation, which empties lazyInlineSteps
+                          //     and needs an immediate replay).
+                          //   - `!openHook`: no hook open in the DURABLE log.
+                          //   - `abortCount === 0`: no hook ABORTED this turn. A hook
+                          //     created AND aborted in the SAME turn is counted in
+                          //     `abortCount`, not `hookCount` (global.ts), and its
+                          //     abort flips only an in-memory queue flag — it needs no
+                          //     durable `hook_created`, so `openHook` (derived from
+                          //     cachedEvents BEFORE handleSuspension) also reads false.
+                          //     Without this term handleSuspension buffers the
+                          //     `hook_received` frame into the batch (exactly what
+                          //     p1-correctness's abort-escape repro exercises), which
+                          //     both puts the unreviewed hook/optimistic-start
+                          //     interaction on the batch path AND breaks the item
+                          //     upper bound below (which has no hook_received term).
+                          //     With it, `hookReceiveds` is provably empty in every
+                          //     collect batch. `hook_received` batching remains a
+                          //     documented follow-up.
                           err.hookCount === 0 &&
+                          err.abortCount === 0 &&
                           !batchOpenState.openHook &&
                           !batchOpenState.openWait;
                         // Worst-case transaction item bound from the suspension
                         // counts alone (leading outcome 2, every step costed as an
                         // inline born-running pair at 3 — the max, pending is 2 —
-                        // each wait 2, plus the run-fence item). Judged here, from
-                        // immutable counts, so an over-budget fan-out takes the
-                        // single path from the start and can NEVER buffer then loop
-                        // on a batch it can't commit: the exact per-frame cost the
-                        // block computes is always <= this bound, so the block's
-                        // budget check is a defensive assertion, not a live branch.
+                        // each wait 2, plus the run-fence item). There is NO
+                        // hook_received term because `collectModeEligible` gates on
+                        // `abortCount === 0`, so `hookReceiveds` is provably empty in
+                        // every collect batch — the bound is exact w.r.t. hooks.
+                        // Judged here, from immutable counts, so an over-budget
+                        // fan-out takes the single path from the start and can NEVER
+                        // buffer then loop on a batch it can't commit: the exact
+                        // per-frame cost the block computes is always <= this bound,
+                        // so the block's budget check is a defensive assertion, not a
+                        // live branch.
                         const collectItemUpperBound =
                           1 +
                           (pendingBatchTransition !== null ? 2 : 0) +
@@ -2148,9 +2168,23 @@ export function workflowEntrypoint(
                           if (batchEvents.length === 0) {
                             // leave collectCommitted false; fall through below.
                           } else if (!withinItemBudget) {
-                            throw new WorkflowRuntimeError(
-                              `collect-mode assembled an over-budget batch (items exceed ${MAX_SUSPENSION_BATCH_ITEMS})`
-                            );
+                            // DEFENSIVE / unreachable: the entry gate's
+                            // `collectItemUpperBound` (from immutable suspension
+                            // counts) already routes an over-budget fan-out to the
+                            // single path, and with `abortCount === 0` there is no
+                            // hook_received term that could push the realized cost
+                            // past that bound — so the realized cost is always <=
+                            // the bound <= MAX. If a future grammar addition ever
+                            // breaks that invariant, degrade to the single path
+                            // rather than throwing OUTSIDE the try (an uncaught throw
+                            // here would crash into redelivery — a livelock). Mirror
+                            // the 404/405 fallback below: disable batching for this
+                            // invocation, flush any deferred completion on the single
+                            // path, and re-derive on a fresh replay that writes this
+                            // suspension's frames individually.
+                            batchTransitionsDisabled = true;
+                            await flushDeferredBatchCompletion();
+                            return await reinvoke(0);
                           } else {
                             // The index of each inline pair's step_started result in
                             // the positional results array: leading outcome (0/1) +
