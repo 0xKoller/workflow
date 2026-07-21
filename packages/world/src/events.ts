@@ -827,6 +827,32 @@ export interface CreateBatchParams {
    * the runtime falls back to `events.list`.
    */
   sinceCursor?: string;
+  /**
+   * v2 suspension-batch fence (opaque to the client — the World/server does the
+   * comparison). The per-run monotonic version the runtime believes is current
+   * when it assembles this batch. A v2-capable World applies the WHOLE batch
+   * conditionally on it: a mismatch (an out-of-band write advanced the run since
+   * the runtime's snapshot) rejects with `PreconditionFailedError` (412) / a 409
+   * and writes nothing, and a run that has no runVersion at all (created before
+   * v2) is rejected so the runtime falls back to the single-write path
+   * permanently for that run. Learned from `run_created`/`run_started` and prior
+   * batch responses (see {@link BatchEventResult.runVersion}). Omitted for v1
+   * batches and Worlds that don't implement the fence, which ignore it.
+   *
+   * NB: this is the World-interface (logical) fence; its HTTP transport on the
+   * Vercel World (header vs. control frame) is finalized in the wire-encoding
+   * step against the v2 server contract.
+   */
+  expectedRunVersion?: number;
+  /**
+   * v2 idempotency key, stable across retries of the SAME suspension attempt so
+   * a redelivered or retried batch is recognized as already-applied. The
+   * World/server records it as the run's last-applied batch id; a batch whose
+   * `batchId` matches the run's current `lastBatchId` resolves successfully with
+   * the current entities and writes nothing (see
+   * {@link BatchEventResult.lastBatchId}). Omitted for v1 batches.
+   */
+  batchId?: string;
 }
 
 /**
@@ -848,6 +874,20 @@ export interface BatchEventResult {
   cursor?: string | null;
   /** Whether additional event pages are available for `events`. */
   hasMore?: boolean;
+  /**
+   * v2 fence echo: the run's monotonic version AFTER this batch applied. The
+   * runtime stores it as the {@link CreateBatchParams.expectedRunVersion} for
+   * the next batch on the same run. Absent from v1 responses and Worlds that
+   * don't implement the fence.
+   */
+  runVersion?: number;
+  /**
+   * v2 idempotency echo: the `batchId` the World/server last applied to this
+   * run. Equals the request's {@link CreateBatchParams.batchId} both on a fresh
+   * apply and on an idempotent already-applied resolution, so the runtime can
+   * confirm its batch is the committed one. Absent from v1 responses.
+   */
+  lastBatchId?: string;
 }
 
 export interface GetEventParams {
