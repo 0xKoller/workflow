@@ -2522,12 +2522,35 @@ export function workflowEntrypoint(
                             pendingBatchTransition = null;
                             // Seed step N+1 from the step_started result (the
                             // last frame), which carries the born-running entity
-                            // and stepCreated.
+                            // and the create-claim signal.
                             const startedResult =
                               batchResult.results[
                                 batchResult.results.length - 1
                               ];
-                            batchPreStartedStep = startedResult?.step;
+                            // Only the invocation whose batch actually WON step
+                            // N+1's create-claim may run its body. The server
+                            // stamps `stepCreated` on the step_started result of
+                            // a fresh born-running commit (workflow-server
+                            // events.ts:4708) and deliberately omits it on an
+                            // idempotent already-applied 200 — where a concurrent
+                            // or redelivered writer committed this exact
+                            // transition first (events.ts:4808-4824) — precisely
+                            // so a non-committer neither double-bills nor re-runs
+                            // the step body. executeStep's `preStarted` path runs
+                            // the body unconditionally on the premise that only
+                            // the committer takes it, so a claim-loser must not:
+                            // mirror the single-event lazy-start path (a lost
+                            // create-claim surfaces as EntityConflictError ->
+                            // `skipped` and never runs the body). Abandon the
+                            // deferred completion and re-derive from a fresh
+                            // replay — the transition is already durable, so the
+                            // replay observes it and runs step N+1's body only if
+                            // this invocation truly owns the claim (existing
+                            // owned-recovery / inline-ownership logic).
+                            if (startedResult?.stepCreated !== true) {
+                              return await reinvoke(0);
+                            }
+                            batchPreStartedStep = startedResult.step;
                             if (!batchPreStartedStep) {
                               throw new WorkflowRuntimeError(
                                 `batch step transition for "${only.correlationId}" returned no started step entity`

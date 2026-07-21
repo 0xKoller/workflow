@@ -25,9 +25,21 @@ vi.mock('@vercel/functions', () => ({
 // deferred, and the second→third transition commits as ONE batch
 // [step_completed(s2), step_created(s3), step_started(s3)]. The third step's
 // own completion is the run's final step, so it flushes on the single path.
-registerStepFunction('bstep1', async () => 'r1');
-registerStepFunction('bstep2', async () => 'r2');
-registerStepFunction('bstep3', async () => 'r3');
+// Body-execution counters so a test can assert exactly-once semantics — a
+// step whose claim this invocation did NOT win must never run its body here.
+const bodyRuns: Record<string, number> = { bstep1: 0, bstep2: 0, bstep3: 0 };
+registerStepFunction('bstep1', async () => {
+  bodyRuns.bstep1 += 1;
+  return 'r1';
+});
+registerStepFunction('bstep2', async () => {
+  bodyRuns.bstep2 += 1;
+  return 'r2';
+});
+registerStepFunction('bstep3', async () => {
+  bodyRuns.bstep3 += 1;
+  return 'r3';
+});
 
 const xform = (name: string) =>
   `;globalThis.__private_workflows = new Map();
@@ -298,6 +310,9 @@ describe('runtime batch step transitions', () => {
   beforeEach(() => {
     // Turbo is mutually exclusive with the (await-then-run) batch path.
     process.env.WORKFLOW_TURBO = '0';
+    bodyRuns.bstep1 = 0;
+    bodyRuns.bstep2 = 0;
+    bodyRuns.bstep3 = 0;
   });
   afterEach(() => {
     if (ORIG_TURBO === undefined) delete process.env.WORKFLOW_TURBO;
@@ -363,6 +378,10 @@ describe('runtime batch step transitions', () => {
     // The batch's step_completed rode a sinceCursor for the inline delta.
     expect(typeof batchCalls[0].params?.sinceCursor).toBe('string');
     expect(created.some((d) => d.eventType === 'run_completed')).toBe(true);
+    // Positive control for the already-applied test below: on a fresh commit
+    // the batch WON s3's claim (stepCreated:true), so its body runs exactly
+    // once via preStarted.
+    expect(bodyRuns.bstep3).toBe(1);
   });
 
   it('world lacks createBatch: falls back to the single-POST path entirely', async () => {
@@ -449,6 +468,81 @@ describe('runtime batch step transitions', () => {
     expect(batchCalls).toHaveLength(1);
     const deferredStep = batchCalls[0].events[0].correlationId!;
     expect(completedFor(created, deferredStep)).toHaveLength(0);
+    expect(created.some((d) => d.eventType === 'run_failed')).toBe(false);
+    expect(
+      returns.some(
+        (r) => r !== null && typeof r === 'object' && 'timeoutSeconds' in r
+      )
+    ).toBe(true);
+  });
+
+  // Idempotent already-applied 200: a concurrent/redelivered writer committed
+  // this exact transition first, so the server returns the current entities
+  // with eventWasCreated=false and NO `stepCreated` on the step_started result
+  // (workflow-server events.ts:4808-4824) — this invocation did NOT win the
+  // create-claim. The client MUST NOT run step N+1's body via `preStarted` (the
+  // single-event lazy path skips a lost claim); it abandons and re-derives from
+  // a fresh replay, which runs the body only if this invocation truly owns it.
+  it('already-applied 200 (no stepCreated): does not run step N+1 body, abandons and nacks', async () => {
+    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
+    const { created, batchCalls, returns } = await driveRun({
+      runId: 'wrun_batch_already_applied',
+      withBatch: true,
+      maxDeliveries: 1,
+      // The winner already committed the whole transition: record its durable
+      // writes (as the winner would have) and return the current entities, but
+      // with eventWasCreated:false and — critically — NO stepCreated on the
+      // step_started result, exactly like resolveStepTransitionBatchCancellation.
+      batchImpl: async (events, durable, rec, runningStep) => {
+        const inputByStep = new Map<string, unknown>();
+        for (const e of events) {
+          if (e.eventType === 'step_created') {
+            inputByStep.set(e.correlationId, e.eventData?.input);
+          }
+        }
+        for (const e of events) rec(e);
+        const results = events.map((data: any) => {
+          if (data.eventType === 'step_completed') {
+            return {
+              eventWasCreated: false,
+              step: { ...runningStep(data), status: 'completed' as const },
+            };
+          }
+          if (data.eventType === 'step_created') {
+            return { eventWasCreated: false, step: runningStep(data) };
+          }
+          // step_started (the claim): already-applied => NO stepCreated.
+          return {
+            eventWasCreated: false,
+            step: runningStep(data, inputByStep.get(data.correlationId)),
+          };
+        });
+        return {
+          results,
+          events: [...durable],
+          cursor: `cursor-${durable.length}`,
+          hasMore: false,
+        };
+      },
+    });
+
+    // The batch was attempted with the full transition shape.
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0].events.map((e) => e.eventType)).toEqual([
+      'step_completed',
+      'step_created',
+      'step_started',
+    ]);
+    const nextStep = batchCalls[0].events[2].correlationId!;
+
+    // The non-committer neither ran step N+1's body nor flushed its completion:
+    // no step_completed(next) via the single path, and the body never executed.
+    expect(bodyRuns.bstep3).toBe(0);
+    expect(completedFor(created, nextStep)).toHaveLength(0);
+    // The run was not completed or failed on this delivery; the invocation
+    // abandoned the deferred completion and nacked (reinvoke) for a fresh
+    // replay that observes the durable transition and applies ownership logic.
+    expect(created.some((d) => d.eventType === 'run_completed')).toBe(false);
     expect(created.some((d) => d.eventType === 'run_failed')).toBe(false);
     expect(
       returns.some(
