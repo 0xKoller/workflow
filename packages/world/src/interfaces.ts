@@ -283,8 +283,10 @@ export interface Storage {
      * and falls back to separate `create` calls. The Vercel World implements it
      * against a batch endpoint so a step transition (complete step N, then
      * create & start step N+1) commits in ONE round-trip instead of two — see
-     * the `WORKFLOW_BATCH_TRANSITIONS` runtime flag. `world-local` and
-     * `world-postgres` don't implement it and behave exactly as today.
+     * the `WORKFLOW_BATCH_TRANSITIONS` runtime flag. `world-local` (a per-run
+     * write sequence guarded by its on-disk exclusive claims) and
+     * `world-postgres` (one `drizzle.transaction`) both implement it too, so the
+     * default-on batch path is exercised on every World.
      *
      * Semantics the runtime relies on:
      * - `events` is ordered and non-empty; the batch applies them in order.

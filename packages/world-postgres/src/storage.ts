@@ -9,6 +9,8 @@ import {
 } from '@workflow/errors';
 import type {
   AttributeChange,
+  BatchEventResult,
+  CreateEventRequest,
   Event,
   EventResult,
   ExperimentalSetAttributesResult,
@@ -1754,6 +1756,270 @@ export function createEventsStorage(drizzle: Drizzle): Storage['events'] {
         hasMore,
         ...(stepCreatedLazily ? { stepCreated: true } : {}),
       };
+    },
+    /**
+     * Batch step transition (WORKFLOW_BATCH_TRANSITIONS). Applies the ordered
+     * transition [step_completed(N), step_created(N+1), step_started(N+1)] for
+     * one run in a SINGLE Postgres transaction — the same all-or-nothing
+     * contract workflow-server#646 provides over HTTP. Either every write
+     * commits or none does: any thrown error rolls the whole transaction back.
+     *
+     * Mirrors the single-`create` per-type logic (guarded UPDATEs, the
+     * born-running create-claim, the unique-index dedup) but threads every read
+     * and write through the transaction handle `tx`. The module-level prepared
+     * statements run on a separate pooled connection and would NOT see the tx's
+     * uncommitted rows, so they are deliberately not used here.
+     *
+     * Result contract the runtime relies on (packages/core/src/runtime.ts):
+     * - `results` holds one EventResult per input event, in order; the runtime
+     *   reads the LAST (the step_started) for the born-running `step` entity and
+     *   the `stepCreated` create-claim signal.
+     * - `stepCreated: true` is stamped on the step_started result ONLY when THIS
+     *   batch won step N+1's create-claim (a fresh born-running commit). On an
+     *   already-applied retry or a lost race it is omitted, so the non-committer
+     *   re-derives from a fresh replay instead of double-running the body —
+     *   matching the server (events.ts:4808-4824).
+     * - A genuine all-or-nothing conflict throws EntityConflictError (the client
+     *   maps it to reinvoke). world-postgres does not enforce the optimistic
+     *   `stateUpdatedAt` guard (neither does its single-`create` path), so it
+     *   never raises 412; the client tolerates its absence.
+     */
+    async createBatch(runId, batchEvents, params): Promise<BatchEventResult> {
+      if (!runId) {
+        throw new WorkflowWorldError(
+          'world-postgres: createBatch requires a runId'
+        );
+      }
+      if (!batchEvents || batchEvents.length === 0) {
+        throw new WorkflowWorldError(
+          'world-postgres: createBatch requires at least one event'
+        );
+      }
+      const resolveData: ResolveData = 'all';
+      const now = new Date();
+      const terminalStepStatuses: (typeof Schema.steps.status.enumValues)[number][] =
+        [...TERMINAL_STEP_STATUSES];
+
+      return drizzle.transaction(async (tx) => {
+        const results: EventResult[] = [];
+        // correlationIds whose step_created frame won its create-claim in THIS
+        // batch — the born-running set. A step_started for a correlationId in
+        // this set is the create-claim winner (stepCreated: true); one absent
+        // from it lost the race / was already applied (stepCreated omitted).
+        const bornRunning = new Set<string>();
+
+        // Insert one event row on `tx` and return the hydrated Event, mirroring
+        // the single-path result construction (see the create() tail above).
+        const insertEvent = async (
+          data: CreateEventRequest,
+          storedEventData: unknown
+        ): Promise<Event> => {
+          const eventId = `wevt_${ulid()}`;
+          const [value] = await tx
+            .insert(events)
+            .values({
+              runId,
+              eventId,
+              correlationId: data.correlationId,
+              eventType: data.eventType,
+              eventData: storedEventData as SerializedContent | undefined,
+              specVersion: data.specVersion ?? SPEC_VERSION_CURRENT,
+            })
+            .returning({ createdAt: events.createdAt });
+          if (!value) {
+            throw new EntityConflictError(
+              `Event ${eventId} could not be created`
+            );
+          }
+          const parsed = EventSchema.parse({
+            ...data,
+            createdAt: value.createdAt,
+            runId,
+            eventId,
+            ...(storedEventData !== undefined
+              ? { eventData: storedEventData }
+              : {}),
+          });
+          return stripEventDataRefs(parsed, resolveData);
+        };
+
+        // Full step re-read on `tx` (for idempotent / already-applied results).
+        const readStep = async (stepId: string): Promise<Step | undefined> => {
+          const [row] = await tx
+            .select()
+            .from(Schema.steps)
+            .where(
+              and(
+                eq(Schema.steps.runId, runId),
+                eq(Schema.steps.stepId, stepId)
+              )
+            )
+            .limit(1);
+          return row ? deserializeStepError(compact(row)) : undefined;
+        };
+
+        for (const data of batchEvents) {
+          const correlationId = data.correlationId;
+          if (!correlationId) {
+            throw new WorkflowWorldError(
+              `world-postgres: createBatch event "${data.eventType}" requires a correlationId`
+            );
+          }
+
+          if (data.eventType === 'step_completed') {
+            const eventData = (data as { eventData?: { result?: unknown } })
+              .eventData;
+            const [stepValue] = await tx
+              .update(Schema.steps)
+              .set({
+                status: 'completed',
+                output: eventData?.result as SerializedContent | undefined,
+                completedAt: now,
+              })
+              .where(
+                and(
+                  eq(Schema.steps.runId, runId),
+                  eq(Schema.steps.stepId, correlationId),
+                  notInArray(Schema.steps.status, terminalStepStatuses)
+                )
+              )
+              .returning();
+            if (stepValue) {
+              const step = deserializeStepError(compact(stepValue));
+              const event = await insertEvent(data, eventData);
+              results.push({ event, step });
+            } else {
+              // 0 rows: the step is missing or already terminal.
+              const existing = await readStep(correlationId);
+              if (!existing) {
+                throw new WorkflowWorldError(
+                  `Step "${correlationId}" not found`
+                );
+              }
+              if (existing.status === 'completed') {
+                // Idempotent: a prior (or concurrent) commit of this exact
+                // transition already completed step N. Reuse the durable row;
+                // writing a second step_completed event would duplicate it (it
+                // is not covered by the entity-creation unique index).
+                results.push({ step: existing });
+              } else {
+                // failed / cancelled: genuine conflict — roll the batch back.
+                throw new EntityConflictError(
+                  `Cannot modify step in terminal state "${existing.status}"`
+                );
+              }
+            }
+          } else if (data.eventType === 'step_created') {
+            const eventData = (
+              data as { eventData: { stepName: string; input: unknown } }
+            ).eventData;
+            const [inserted] = await tx
+              .insert(Schema.steps)
+              .values({
+                runId,
+                stepId: correlationId,
+                stepName: eventData.stepName,
+                input: eventData.input as SerializedContent,
+                status: 'pending',
+                attempt: 0,
+                specVersion: data.specVersion ?? SPEC_VERSION_CURRENT,
+              })
+              .onConflictDoNothing()
+              .returning();
+            if (inserted) {
+              // Won the create-claim: born-running. Record the step_created
+              // event so replay observes create-before-start.
+              bornRunning.add(correlationId);
+              const step = deserializeStepError(compact(inserted));
+              const event = await insertEvent(data, eventData);
+              results.push({ event, step });
+            } else {
+              // Lost / already-applied: the step already exists. Don't write a
+              // duplicate step_created event (would violate the entity-creation
+              // unique index and abort the whole batch).
+              const existing = await readStep(correlationId);
+              results.push(existing ? { step: existing } : {});
+            }
+          } else if (data.eventType === 'step_started') {
+            if (bornRunning.has(correlationId)) {
+              // We created step N+1 in this batch: transition it to running and
+              // stamp the create-claim signal.
+              const [stepValue] = await tx
+                .update(Schema.steps)
+                .set({
+                  status: 'running',
+                  attempt: sql`${Schema.steps.attempt} + 1`,
+                  startedAt: sql`COALESCE(${Schema.steps.startedAt}, ${now.toISOString()})`,
+                  retryAfter: null,
+                })
+                .where(
+                  and(
+                    eq(Schema.steps.runId, runId),
+                    eq(Schema.steps.stepId, correlationId),
+                    notInArray(Schema.steps.status, terminalStepStatuses)
+                  )
+                )
+                .returning();
+              if (!stepValue) {
+                // The step we just created cannot already be terminal — a
+                // 0-row update here is a real invariant violation.
+                throw new WorkflowWorldError(
+                  `Step "${correlationId}" could not be started in batch`
+                );
+              }
+              const step = deserializeStepError(compact(stepValue));
+              // step_started never carries `input` (it lives on step_created);
+              // strip defensively to match the single path.
+              const { input: _omitInput, ...rest } = ((
+                data as { eventData?: Record<string, unknown> }
+              ).eventData ?? {}) as Record<string, unknown>;
+              const event = await insertEvent(data, rest);
+              results.push({ event, step, stepCreated: true });
+            } else {
+              // We did NOT create step N+1 (already applied by another
+              // committer, or a lost race). Return the current entity WITHOUT
+              // stepCreated so the client re-derives from a fresh replay.
+              const existing = await readStep(correlationId);
+              results.push(existing ? { step: existing } : {});
+            }
+          } else {
+            throw new WorkflowWorldError(
+              `world-postgres: createBatch does not support event type "${data.eventType}"`
+            );
+          }
+        }
+
+        // Optional inline delta: the events written strictly after
+        // `sinceCursor`, same semantics as events.list (ULID-ordered). Computed
+        // in-tx so it reflects exactly what this batch committed.
+        let deltaEvents: Event[] | undefined;
+        let cursor: string | null | undefined;
+        let hasMore: boolean | undefined;
+        if (typeof params?.sinceCursor === 'string') {
+          const limit = 100;
+          const rows = await tx
+            .select()
+            .from(events)
+            .where(
+              and(
+                eq(events.runId, runId),
+                gt(events.eventId, params.sinceCursor)
+              )
+            )
+            .orderBy(events.eventId)
+            .limit(limit + 1);
+          const page = rows.slice(0, limit);
+          deltaEvents = page.map((e) => {
+            e.eventData ||= e.eventDataJson;
+            const parsed = EventSchema.parse(compact(e));
+            return stripEventDataRefs(parsed, resolveData);
+          });
+          cursor = page.at(-1)?.eventId ?? null;
+          hasMore = rows.length > limit;
+        }
+
+        return { results, events: deltaEvents, cursor, hasMore };
+      });
     },
     async get(
       runId: string,
