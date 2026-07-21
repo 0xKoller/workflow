@@ -75,7 +75,10 @@ import {
   stepLeaseRemainingSeconds,
 } from './runtime/step-ownership.js';
 import { runStepSingleFlight } from './runtime/step-single-flight.js';
-import { assembleSuspensionBatch } from './runtime/suspension-batch.js';
+import {
+  assembleSuspensionBatch,
+  MAX_SUSPENSION_BATCH_ITEMS,
+} from './runtime/suspension-batch.js';
 import { handleSuspension } from './runtime/suspension-handler.js';
 import { getWaitContinuationDispatch } from './runtime/wait-continuation.js';
 import {
@@ -1794,6 +1797,67 @@ export function workflowEntrypoint(
                           !batchOpenState.openHook &&
                           !batchOpenState.openWait;
 
+                        // Collect-mode (v2 full suspension batching, the Temporal
+                        // suspension-committing analog): fold THIS suspension's
+                        // whole batchable event set — a leading deferred
+                        // completion (if any), the inline born-running step pairs,
+                        // the fan-out pending `step_created`s, and the
+                        // `wait_created`s — into ONE fenced `createBatch`, instead
+                        // of the per-event writes handleSuspension would otherwise
+                        // issue. This is the strict generalization of the v1
+                        // sequential batch above (`batchTransitionCandidate`),
+                        // which stays as-is for the clean single-step chain; the
+                        // two are mutually exclusive by construction
+                        // (`!batchTransitionCandidate` below). We admit only CLEAN
+                        // step/wait fan-out here: no open hook/wait, no attribute
+                        // write. `hook_received` is buffered by handleSuspension
+                        // but deliberately never occurs under this gate (open-hook
+                        // suspensions are excluded), so its optimistic-start
+                        // interaction stays off the batch path — a documented
+                        // follow-up. `collecting` decides whether handleSuspension
+                        // BUFFERS its batchable frames (into `batchFrames`) rather
+                        // than writing them; it must be known before the call.
+                        const collectModeEligible =
+                          isBatchTransitionsEnabled() &&
+                          typeof world.events.createBatch === 'function' &&
+                          !batchTransitionsDisabled &&
+                          !batchDisabledForRun &&
+                          !turbo &&
+                          err.attributeCount === 0 &&
+                          // No hook creation this suspension and none open in the
+                          // run: keeps the whole hook / hook_received /
+                          // optimistic-start interaction off the batch path (a
+                          // hook-creating suspension also sets hasAwaitedHookCreation
+                          // which empties lazyInlineSteps and needs an immediate
+                          // replay). `hook_received` batching is a documented
+                          // follow-up; the handler buffers it but it never occurs
+                          // under this gate.
+                          err.hookCount === 0 &&
+                          !batchOpenState.openHook &&
+                          !batchOpenState.openWait;
+                        // Worst-case transaction item bound from the suspension
+                        // counts alone (leading outcome 2, every step costed as an
+                        // inline born-running pair at 3 — the max, pending is 2 —
+                        // each wait 2, plus the run-fence item). Judged here, from
+                        // immutable counts, so an over-budget fan-out takes the
+                        // single path from the start and can NEVER buffer then loop
+                        // on a batch it can't commit: the exact per-frame cost the
+                        // block computes is always <= this bound, so the block's
+                        // budget check is a defensive assertion, not a live branch.
+                        const collectItemUpperBound =
+                          1 +
+                          (pendingBatchTransition !== null ? 2 : 0) +
+                          err.stepCount * 3 +
+                          err.waitCount * 2;
+                        const collecting =
+                          collectModeEligible &&
+                          !batchTransitionCandidate &&
+                          collectItemUpperBound <= MAX_SUSPENSION_BATCH_ITEMS &&
+                          (err.stepCount >= 2 ||
+                            err.waitCount >= 1 ||
+                            (pendingBatchTransition !== null &&
+                              err.stepCount >= 1));
+
                         // A completion is deferred but this transition cannot be
                         // batched (the run moved to parallel steps, a hook/wait,
                         // run completion is handled above, or batching is
@@ -1801,10 +1865,15 @@ export function workflowEntrypoint(
                         // handleSuspension writes any dependent event — the
                         // journal must keep completed(N) ahead of the next
                         // suspension's writes — then re-replay from the durable
-                        // state and handle this suspension normally.
+                        // state and handle this suspension normally. Skipped when
+                        // `collecting`: the collect batch below folds the deferred
+                        // completion in as its leading outcome, so flushing here
+                        // would defeat it (and reorder completed(N) ahead of the
+                        // atomic batch).
                         if (
                           pendingBatchTransition &&
-                          !batchTransitionCandidate
+                          !batchTransitionCandidate &&
+                          !collecting
                         ) {
                           const flushed = await flushDeferredBatchCompletion();
                           if (flushed === 'stale') return await reinvoke(0);
@@ -1827,6 +1896,12 @@ export function workflowEntrypoint(
                             requestId,
                             eventLog: suspensionLog,
                             runReadyBarrier,
+                            // Collect-mode: buffer the batchable frames (pending
+                            // creates, waits, abort hook_received) into
+                            // `batchFrames` instead of writing them, so the
+                            // collect block below commits them in one fenced
+                            // batch. Off for every non-collecting suspension.
+                            collectBatchFrames: collecting,
                           });
                         } catch (suspensionError) {
                           // A suspension create whose stale (412) rejection
@@ -1994,6 +2069,232 @@ export function workflowEntrypoint(
                         const inlineCorrelationIds = new Set(
                           lazyInlineSteps.map((s) => s.correlationId)
                         );
+
+                        // Collect-mode commit (v2 full suspension batching).
+                        // Committed HERE — before the dispatch loop below — so the
+                        // buffered fan-out `step_created`s become durable ahead of
+                        // their enqueue and the wait continuation is armed after
+                        // the wait is committed, WITHOUT reordering the dispatch
+                        // loop: its natural position is already post-commit. The
+                        // buffered pending steps sit in `pendingSteps` as
+                        // non-inline, unowned entries, so the existing
+                        // "immediate enqueue" branch queues them unchanged once
+                        // this batch has made them durable.
+                        //
+                        // `batchPreStartedSteps` seeds each inline step's
+                        // born-running entity for executeStep's `preStarted` path
+                        // (the body runs against the committed step — no start
+                        // POST, no create-claim to lose). `collectCommitted` gates
+                        // the inline wiring and suppresses the v1 batch block and
+                        // the chained-defer / inline-delta optimizations below.
+                        let collectCommitted = false;
+                        const batchPreStartedSteps = new Map<string, Step>();
+                        if (collecting) {
+                          const frames = suspensionResult.batchFrames;
+                          // The inline born-running pairs — one per deferred
+                          // lazy-inline step, in the handler's deterministic
+                          // order. `created` carries the dehydrated input;
+                          // `started` carries the inline-ownership stamp. The
+                          // server folds each adjacent created+started into a
+                          // born-running entity and strips the started's input.
+                          const inlinePairs = lazyInlineSteps.map((s) => ({
+                            created: {
+                              eventType: 'step_created' as const,
+                              specVersion: SPEC_VERSION_CURRENT,
+                              correlationId: s.correlationId,
+                              eventData: {
+                                stepName: s.stepName,
+                                workflowName,
+                                input: s.dehydratedInput,
+                              },
+                            },
+                            started: {
+                              eventType: 'step_started' as const,
+                              specVersion: SPEC_VERSION_CURRENT,
+                              correlationId: s.correlationId,
+                              eventData: {
+                                stepName: s.stepName,
+                                workflowName,
+                                ...(metadata.messageId !== undefined
+                                  ? { ownerMessageId: metadata.messageId }
+                                  : {}),
+                              },
+                            },
+                          }));
+                          const leadingOutcome =
+                            pendingBatchTransition?.completedRequest;
+                          const hookReceiveds = frames?.hookReceiveds ?? [];
+                          const pendingCreates = frames?.pendingCreates ?? [];
+                          const waits = frames?.waits ?? [];
+                          const { events: batchEvents, withinItemBudget } =
+                            assembleSuspensionBatch({
+                              leadingOutcome,
+                              hookReceiveds,
+                              inlineSteps: inlinePairs,
+                              pendingSteps: pendingCreates,
+                              waits,
+                            });
+                          // The `collecting` gate keys off the suspension COUNTS,
+                          // but the realized frame set can be empty — e.g. a
+                          // re-suspension whose wait already has its created event
+                          // (nothing new to write) with no leading completion. An
+                          // empty batch means handleSuspension buffered nothing, so
+                          // there is nothing unwritten to lose: skip the batch and
+                          // fall through to the normal dispatch (which arms the
+                          // wait continuation / handles owned-recovery) unchanged.
+                          // The item budget is guaranteed by the entry gate's
+                          // upper bound, so a non-empty over-budget batch is an
+                          // invariant violation, not a live fallback.
+                          if (batchEvents.length === 0) {
+                            // leave collectCommitted false; fall through below.
+                          } else if (!withinItemBudget) {
+                            throw new WorkflowRuntimeError(
+                              `collect-mode assembled an over-budget batch (items exceed ${MAX_SUSPENSION_BATCH_ITEMS})`
+                            );
+                          } else {
+                            // The index of each inline pair's step_started result in
+                            // the positional results array: leading outcome (0/1) +
+                            // the hook_received frames, then (created, started) pairs
+                            // contiguously — started is the second of each pair.
+                            const startedBaseIndex =
+                              (leadingOutcome ? 1 : 0) + hookReceiveds.length;
+                            const inlineClaimStateUpdatedAt =
+                              stateUpdatedAtForCreate(cachedEvents ?? []);
+                            const batchId = `bat_${ulid()}`;
+                            try {
+                              // biome-ignore lint/style/noNonNullAssertion: collectModeEligible implies createBatch is a function
+                              const batchResult = await world.events
+                                .createBatch!(runId, batchEvents, {
+                                requestId,
+                                // v2 fence: collectModeEligible gates on
+                                // !batchDisabledForRun, so expectedRunVersion is a
+                                // number here.
+                                expectedRunVersion,
+                                batchId,
+                                ...(pendingBatchTransition?.sinceCursor
+                                  ? {
+                                      sinceCursor:
+                                        pendingBatchTransition.sinceCursor,
+                                    }
+                                  : {}),
+                                ...(inlineClaimStateUpdatedAt !== undefined
+                                  ? {
+                                      stateUpdatedAt: inlineClaimStateUpdatedAt,
+                                    }
+                                  : {}),
+                              });
+                              pendingBatchTransition = null;
+                              expectedRunVersion =
+                                batchResult.runVersion ?? expectedRunVersion;
+                              // All-or-nothing ownership. A fresh commit stamps
+                              // `stepCreated` on EVERY inline step_started result; an
+                              // idempotent already-applied 200 stamps NONE (a
+                              // concurrent or redelivered writer committed this exact
+                              // batch first). Since the batch is atomic those are the
+                              // only two outcomes — but check every inline frame, and
+                              // if any is unstamped, this invocation did not win the
+                              // commit: abandon and re-derive from a fresh replay so
+                              // no body runs off a batch we didn't own (mirrors the
+                              // single-event lazy-start claim-loss → skipped path).
+                              let ownsAllInline = true;
+                              for (let i = 0; i < inlinePairs.length; i++) {
+                                const startedResult =
+                                  batchResult.results[
+                                    startedBaseIndex + 2 * i + 1
+                                  ];
+                                if (startedResult?.stepCreated !== true) {
+                                  ownsAllInline = false;
+                                  break;
+                                }
+                                if (!startedResult.step) {
+                                  throw new WorkflowRuntimeError(
+                                    `collect-mode batch for "${lazyInlineSteps[i].correlationId}" returned no started step entity`
+                                  );
+                                }
+                                batchPreStartedSteps.set(
+                                  lazyInlineSteps[i].correlationId,
+                                  startedResult.step
+                                );
+                              }
+                              if (!ownsAllInline) {
+                                return await reinvoke(0);
+                              }
+                              // Merge the batch's event-log delta so the dispatch
+                              // loop and the next replay see the whole transition as
+                              // durable (dedupe by eventId), exactly like the v1
+                              // batch and the inline-delta fast path.
+                              if (batchResult.events) {
+                                if (
+                                  batchResult.events.length > 0 &&
+                                  cachedEvents
+                                ) {
+                                  const existingIds = new Set(
+                                    cachedEvents.map((e) => e.eventId)
+                                  );
+                                  for (const e of batchResult.events) {
+                                    if (!existingIds.has(e.eventId)) {
+                                      existingIds.add(e.eventId);
+                                      cachedEvents.push(e);
+                                    }
+                                  }
+                                }
+                                eventsCursor =
+                                  batchResult.cursor ?? eventsCursor;
+                              } else {
+                                const loaded =
+                                  await loadWorkflowRunEvents(runId);
+                                cachedEvents = loaded.events;
+                                eventsCursor = loaded.cursor;
+                              }
+                              collectCommitted = true;
+                            } catch (batchErr) {
+                              // Endpoint absent on an older server (404/405): nothing
+                              // was written (all-or-nothing) — disable batching for
+                              // the rest of this invocation, flush any deferred
+                              // completion on the single path, and re-derive from a
+                              // fresh replay that recreates this suspension's frames
+                              // individually.
+                              if (
+                                WorkflowWorldError.is(batchErr) &&
+                                (batchErr.status === 404 ||
+                                  batchErr.status === 405)
+                              ) {
+                                batchTransitionsDisabled = true;
+                                await flushDeferredBatchCompletion();
+                                return await reinvoke(0);
+                              }
+                              // Pre-v2 run (409 run-not-versioned): immutable, latch
+                              // batching off for the run permanently, flush, reinvoke.
+                              if (
+                                WorkflowWorldError.is(batchErr) &&
+                                batchErr.code === 'run-not-versioned'
+                              ) {
+                                batchDisabledForRun = true;
+                                await flushDeferredBatchCompletion();
+                                return await reinvoke(0);
+                              }
+                              // Stale snapshot (412) or all-or-nothing conflict
+                              // (409 suspension-batch-conflict) / run-not-running
+                              // (410): nothing written. Abandon the deferred
+                              // completion (the fresh replay re-derives it and this
+                              // suspension's frames, mapping a lost step to the
+                              // existing skipped/terminal handling) and re-invoke.
+                              if (
+                                PreconditionFailedError.is(batchErr) ||
+                                EntityConflictError.is(batchErr) ||
+                                RunExpiredError.is(batchErr)
+                              ) {
+                                pendingBatchTransition = null;
+                                return await reinvoke(0);
+                              }
+                              // Transient transport failure: rethrow for queue
+                              // redelivery. The batch is idempotent end-to-end (a
+                              // fully-applied batch replays to 200), so retrying the
+                              // whole transition is safe.
+                              throw batchErr;
+                            }
+                          }
+                        }
 
                         // Unified queue dispatch for everything we are NOT
                         // inline-executing. Steps are queued with stepId so
@@ -2290,6 +2591,13 @@ export function workflowEntrypoint(
                           !batchTransitionsDisabled &&
                           !batchDisabledForRun &&
                           !turbo &&
+                          // A collect-mode commit already advanced this run's
+                          // fence and committed a multi-frame batch; keep the
+                          // chained single-step defer off after it so the two
+                          // deferral machineries never interleave in one
+                          // invocation. The inline step writes its own completion
+                          // normally and the next suspension collects fresh.
+                          !collectCommitted &&
                           inlineExecutions.length === 1 &&
                           lazyInlineSteps.length === 1 &&
                           ownedRecoverySteps.length === 0 &&
@@ -2370,6 +2678,10 @@ export function workflowEntrypoint(
 
                         const requestInlineDelta =
                           typeof preInlineWriteCursor === 'string' &&
+                          // Already merged the batch's delta into cachedEvents on a
+                          // collect commit; don't also request an inline delta on
+                          // the (single) inline step's completion write.
+                          !collectCommitted &&
                           err.stepCount === 1 &&
                           err.waitCount === 0 &&
                           pendingSteps.length === 1 &&
@@ -2778,9 +3090,19 @@ export function workflowEntrypoint(
                                 // the body against that entity — no start POST,
                                 // no create-claim to lose. Mutually exclusive
                                 // with lazyStepInput's optimistic/lazy start.
-                                ...(batchTransitionActive && batchPreStartedStep
-                                  ? { preStarted: batchPreStartedStep }
-                                  : {}),
+                                // Collect-mode seeds a per-correlationId entity
+                                // (one inline pair per fan-out step); v1 seeds the
+                                // single sequential step.
+                                ...(collectCommitted &&
+                                batchPreStartedSteps.has(s.correlationId)
+                                  ? {
+                                      preStarted: batchPreStartedSteps.get(
+                                        s.correlationId
+                                      ),
+                                    }
+                                  : batchTransitionActive && batchPreStartedStep
+                                    ? { preStarted: batchPreStartedStep }
+                                    : {}),
                                 // Batch transition: defer this step's terminal
                                 // step_completed so the next transition folds it
                                 // into one batch POST. No inline delta is
@@ -2797,7 +3119,8 @@ export function workflowEntrypoint(
                                 ...(stepIndex === 0 &&
                                 s.lazyStepInput !== undefined &&
                                 latencyTracking &&
-                                !batchTransitionActive
+                                !batchTransitionActive &&
+                                !collectCommitted
                                   ? { latencyTracking }
                                   : {}),
                                 ...(requestInlineDelta &&
