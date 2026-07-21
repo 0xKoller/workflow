@@ -276,7 +276,7 @@ export function isTurboEnabled(): boolean {
 }
 
 /**
- * Whether durable batch step transitions are enabled (default OFF). When on
+ * Whether durable batch step transitions are enabled (default ON). When on
  * AND the World implements `events.createBatch`, the sequential inline path
  * collapses a step transition — completing step N and creating + starting the
  * lone next inline step N+1 — into a single atomic batch POST, instead of the
@@ -285,18 +285,26 @@ export function isTurboEnabled(): boolean {
  * This is NOT optimistic start: step N+1's body still runs only after its claim
  * and start are durable. The latency win comes purely from collapsing two RTTs
  * into one; the create-claim now commits atomically with the previous
- * completion (strictly fewer intermediate crash states). Off by default and
- * gated independently of the other inline optimizations — a World that lacks
- * `createBatch`, or a server without the batch endpoint, transparently falls
- * back to today's separate awaited POSTs.
+ * completion (strictly fewer intermediate crash states). Gated independently of
+ * the other inline optimizations — a World that lacks `createBatch`, or a
+ * server without the batch endpoint, transparently falls back to today's
+ * separate awaited POSTs.
  *
- * Reads `process.env.WORKFLOW_BATCH_TRANSITIONS` lazily. Enabled only by an
- * explicit `'1'` / `'true'` (case-insensitive).
+ * `WORKFLOW_BATCH_TRANSITIONS=0` (or `false`) is the **emergency kill switch**:
+ * it restores the exact two-POST single-event path (`step_completed` then
+ * `step_started`), mirroring the default-on + kill-switch shape of
+ * `WORKFLOW_TURBO` and `WORKFLOW_RETURN_VALUE_STREAM`. This switch is
+ * **temporary** — it exists for emergency rollback during burn-in and is
+ * planned for removal once the batch path has production mileage. It is not a
+ * user-configurable feature.
+ *
+ * Reads `process.env.WORKFLOW_BATCH_TRANSITIONS` lazily. Disabled only by an
+ * explicit `'0'` / `'false'` (case-insensitive).
  */
 export function isBatchTransitionsEnabled(): boolean {
   const raw = process.env.WORKFLOW_BATCH_TRANSITIONS;
-  if (raw === undefined || raw === '') return false;
-  return raw === '1' || raw.toLowerCase() === 'true';
+  if (raw === undefined || raw === '') return true;
+  return !(raw === '0' || raw.toLowerCase() === 'false');
 }
 
 /**

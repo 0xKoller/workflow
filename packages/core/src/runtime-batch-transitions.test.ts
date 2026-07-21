@@ -310,6 +310,10 @@ describe('runtime batch step transitions', () => {
   beforeEach(() => {
     // Turbo is mutually exclusive with the (await-then-run) batch path.
     process.env.WORKFLOW_TURBO = '0';
+    // Batching is default-ON; clearing the var establishes that true default as
+    // the baseline for every test, so a test only opts OUT by throwing the
+    // kill switch ('0'). No test needs an explicit '1' to enable it.
+    delete process.env.WORKFLOW_BATCH_TRANSITIONS;
     bodyRuns.bstep1 = 0;
     bodyRuns.bstep2 = 0;
     bodyRuns.bstep3 = 0;
@@ -323,8 +327,12 @@ describe('runtime batch step transitions', () => {
     vi.clearAllMocks();
   });
 
-  it('flag OFF: never calls createBatch and keeps the two-POST-per-step pattern', async () => {
-    delete process.env.WORKFLOW_BATCH_TRANSITIONS;
+  it('kill switch (WORKFLOW_BATCH_TRANSITIONS=0): never calls createBatch and keeps the two-POST-per-step pattern', async () => {
+    // The emergency kill switch restores the exact single-event two-POST path —
+    // byte-identical to pre-feature behavior even when the World implements
+    // createBatch. '0' and 'false' both disable; assert with '0' here (the
+    // attr-ordering suite covers 'false' equivalence).
+    process.env.WORKFLOW_BATCH_TRANSITIONS = '0';
     const { created, createBatch } = await driveRun({
       runId: 'wrun_batch_off',
       withBatch: true,
@@ -341,8 +349,9 @@ describe('runtime batch step transitions', () => {
     expect(created.some((d) => d.eventType === 'run_completed')).toBe(true);
   });
 
-  it('flag ON: folds the middle transition into one batch [completed, created, started]', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
+  it('default (no env var, batching ON): folds the middle transition into one batch [completed, created, started]', async () => {
+    // No WORKFLOW_BATCH_TRANSITIONS set (beforeEach cleared it): this asserts the
+    // default-ON behavior directly, not an explicitly-enabled path.
     const { created, batchCalls } = await driveRun({
       runId: 'wrun_batch_on',
       withBatch: true,
@@ -385,7 +394,6 @@ describe('runtime batch step transitions', () => {
   });
 
   it('world lacks createBatch: falls back to the single-POST path entirely', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
     const { created } = await driveRun({
       runId: 'wrun_batch_absent',
       withBatch: false,
@@ -400,7 +408,6 @@ describe('runtime batch step transitions', () => {
   });
 
   it('404 endpoint absent: disables batching for the invocation, flushes, and completes via single POSTs', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
     const { created, createBatch } = await driveRun({
       runId: 'wrun_batch_404',
       withBatch: true,
@@ -426,7 +433,6 @@ describe('runtime batch step transitions', () => {
   // the subsequent re-derivation exercises the ordinary single-POST/owned-
   // recovery paths, which are covered elsewhere.
   it('409 conflict: abandons the deferred completion and nacks without failing the run', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
     const { created, batchCalls, returns } = await driveRun({
       runId: 'wrun_batch_409',
       withBatch: true,
@@ -456,7 +462,6 @@ describe('runtime batch step transitions', () => {
   });
 
   it('410 run-not-running: abandons the deferred completion and nacks without failing the run', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
     const { created, batchCalls, returns } = await driveRun({
       runId: 'wrun_batch_410',
       withBatch: true,
@@ -484,7 +489,6 @@ describe('runtime batch step transitions', () => {
   // single-event lazy path skips a lost claim); it abandons and re-derives from
   // a fresh replay, which runs the body only if this invocation truly owns it.
   it('already-applied 200 (no stepCreated): does not run step N+1 body, abandons and nacks', async () => {
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
     const { created, batchCalls, returns } = await driveRun({
       runId: 'wrun_batch_already_applied',
       withBatch: true,

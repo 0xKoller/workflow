@@ -72,7 +72,9 @@ describe('runtime batch already-applied (adversarial)', () => {
 
   beforeEach(() => {
     process.env.WORKFLOW_TURBO = '0';
-    process.env.WORKFLOW_BATCH_TRANSITIONS = '1';
+    // Batching is default-ON; clear the var so these adversarial cases run on
+    // the true default path rather than an explicitly-enabled one.
+    delete process.env.WORKFLOW_BATCH_TRANSITIONS;
     execCount.aa1 = 0;
     execCount.aa2 = 0;
     execCount.aa3 = 0;
