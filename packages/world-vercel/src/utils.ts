@@ -33,16 +33,24 @@ import { version } from './version.js';
  * Prefer `VERCEL_WORKFLOW_SERVER_URL` for deployment-time configuration.
  *
  * INTENTIONAL REVIEW-TIME PIN (do not merge with this set): points the
- * world-vercel HTTP client at the workflow-server#646 preview deployment
- * (head a588ed3d) so this PR's e2e/integration lanes exercise the real
- * batched `POST /api/v4/runs/:runId/events/batch` backend before #646 is
- * promoted to production. The CI lint rule that requires this constant to
- * be empty on `main` will FAIL while this pin is present — that failure is
- * the deliberate merge gate, not a bug to work around. Removal is a
- * single-line revert to `''` once #646 ships to production.
+ * world-vercel HTTP client at the workflow-server#646 BRANCH-TRACKING alias
+ * so this PR's e2e/integration lanes exercise the real batched
+ * `POST /api/v4/runs/:runId/events/batch` v2 (suspension-batch fence + full
+ * grammar) backend before #646 is promoted to production. The alias always
+ * resolves to the latest deployment of the server branch
+ * (`pgp/batch-step-transitions`), so a new server push needs NO re-pin here.
+ *
+ * CAVEAT (documented in the PR): because the pin floats with the server
+ * branch rather than a fixed deployment, a server force-push mid-CI could
+ * shift the backend under a running e2e round — acceptable for review.
+ *
+ * The CI lint rule that requires this constant to be empty on `main` will
+ * FAIL while this pin is present — that failure is the deliberate merge
+ * gate, not a bug to work around. Removal is a single-line revert to `''`
+ * once #646 ships to production.
  */
 export const WORKFLOW_SERVER_URL_OVERRIDE =
-  'https://workflow-server-8sp9l2esp.vercel.sh';
+  'https://workflow-server-git-pgp-batch-step-transitions.vercel.sh';
 
 /**
  * HTTP methods that are safe to transparently re-issue inside the adapter.
