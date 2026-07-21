@@ -6,13 +6,18 @@
 '@workflow/core': minor
 ---
 
-Batch step transitions: fold a sequential inline step transition — completing
-step N and creating + starting the lone next inline step N+1 — into ONE durable,
-atomic write instead of two serialized event writes (`step_completed` then a
-lazy `step_started`). This is not optimistic start: step N+1's body still runs
-only after the batch (its durable claim) returns; the win is removing a full
-round-trip per step, and the create-claim for N+1 now commits atomically with
-N's completion (strictly fewer intermediate crash states).
+Batch step transitions: fold a workflow suspension's event writes into ONE
+durable, atomic, fenced write instead of a serialized event write per frame.
+
+The sequential case — completing step N and creating + starting the lone next
+inline step N+1 — collapses two serialized writes (`step_completed` then a lazy
+`step_started`) into one. Full **suspension batching** generalizes this to a
+whole fan-out suspension: a leading deferred completion, the inline
+born-running steps, the fan-out pending `step_created`s, and the `wait_created`s
+commit together in one batch (the Temporal suspension-committing analog). This
+is not optimistic start: a batched step's body still runs only after the batch
+(its durable claim) returns; the win is removing round-trips, and every
+create-claim commits atomically (strictly fewer intermediate crash states).
 
 On by default, with an emergency kill switch: `WORKFLOW_BATCH_TRANSITIONS=0`
 (or `false`) restores the exact prior two-write path byte-for-byte, mirroring
