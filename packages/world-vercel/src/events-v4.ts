@@ -197,6 +197,19 @@ export interface CreateEventV4Input {
    * without a loaded event log; older servers ignore it entirely.
    */
   stateUpdatedAt?: number;
+  /**
+   * v2 suspension-batch fence — the run version the client expects, carried on
+   * the batch's PRIMARY (index-0) frame only. The server asserts it and sets
+   * runVersion = expectedRunVersion + 1 in the same conditional transaction.
+   * Ignored on non-batch POSTs and by older servers.
+   */
+  expectedRunVersion?: number;
+  /**
+   * v2 suspension-batch idempotency key, carried on the PRIMARY (index-0) frame.
+   * A retried batch reuses it so the server recognizes an already-applied batch
+   * (lastBatchId === batchId → idempotent 200). Ignored elsewhere.
+   */
+  batchId?: string;
 }
 
 export interface CreateEventV4Result {
@@ -284,6 +297,12 @@ function buildPostFrameMeta(
   if (input.stateUpdatedAt !== undefined) {
     meta.stateUpdatedAt = input.stateUpdatedAt;
   }
+  // v2 suspension-batch fence — set only on the primary frame by the batch
+  // adapter; the server reads both off frameMetas[0].
+  if (input.expectedRunVersion !== undefined) {
+    meta.expectedRunVersion = input.expectedRunVersion;
+  }
+  if (input.batchId !== undefined) meta.batchId = input.batchId;
   return meta;
 }
 
@@ -433,6 +452,9 @@ export interface CreateEventBatchV4Result {
     cursor?: string | null;
     hasMore?: boolean;
   };
+  /** v2 fence: the run's monotonic version AFTER this batch applied (server
+   *  top-level field). Absent from a v1 server. */
+  runVersion?: number;
 }
 
 /**
@@ -500,6 +522,7 @@ export async function createWorkflowRunEventsBatchV4(
             cursor?: string | null;
             hasMore?: boolean;
           };
+          runVersion?: number;
         })
       : {};
   const results = Array.isArray(decoded.results)
@@ -508,6 +531,9 @@ export async function createWorkflowRunEventsBatchV4(
   return {
     results,
     ...(decoded.eventsDelta ? { eventsDelta: decoded.eventsDelta } : {}),
+    ...(typeof decoded.runVersion === 'number'
+      ? { runVersion: decoded.runVersion }
+      : {}),
   };
 }
 

@@ -182,6 +182,13 @@ export function errorForResponse(
   } = {}
 ): Error {
   const { retryAfter, code, url, mitigated } = opts;
+  // v2 suspension-batch: a pre-v2 run is rejected 409 run-not-versioned. Keep it
+  // a plain WorkflowWorldError carrying the code (NOT EntityConflictError) so the
+  // runtime can tell it apart from a transient suspension-batch-conflict (also
+  // 409) and latch batching off permanently for the run instead of retrying.
+  if (status === 409 && code === 'run-not-versioned') {
+    return new WorkflowWorldError(message, { url, status, code, retryAfter });
+  }
   if (status === 409) return new EntityConflictError(message);
   if (status === 410) return new RunExpiredError(message);
   if (status === 412)

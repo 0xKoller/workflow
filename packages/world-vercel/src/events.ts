@@ -789,27 +789,36 @@ function bagToEventResult(
 function toBatchEventV4Input(
   runId: string,
   data: CreateEventRequest,
-  batchParams?: CreateBatchParams
+  batchParams: CreateBatchParams | undefined,
+  isPrimaryFrame: boolean
 ): BatchEventV4Input {
   const { payload, meta } = splitEventDataForV4(data);
   const remoteRefBehavior = eventsNeedingResolve.has(data.eventType)
     ? 'resolve'
     : 'lazy';
-  // sinceCursor / stateUpdatedAt ride on the step_completed frame only — the
-  // server reads them off the batch's "primary" (step_completed) frame, and a
-  // create+start-only batch has no completion to guard or diff against.
-  const isCompletion = data.eventType === 'step_completed';
+  // Batch-level params ride on the PRIMARY (index-0) frame — the server reads
+  // sinceCursor / stateUpdatedAt / the v2 fence off frameMetas[0]. For the
+  // sequential transition frame 0 is the step_completed, so this matches the
+  // single-POST placement; keying on the index (not the type) also keeps a
+  // future no-leading-completion batch correct.
   return {
     runId,
     eventType: data.eventType,
     specVersion: data.specVersion ?? 2,
     ...(data.correlationId ? { correlationId: data.correlationId } : {}),
     ...(batchParams?.requestId ? { vercelId: batchParams.requestId } : {}),
-    ...(isCompletion && batchParams?.sinceCursor
+    ...(isPrimaryFrame && batchParams?.sinceCursor
       ? { sinceCursor: batchParams.sinceCursor }
       : {}),
-    ...(isCompletion && batchParams?.stateUpdatedAt !== undefined
+    ...(isPrimaryFrame && batchParams?.stateUpdatedAt !== undefined
       ? { stateUpdatedAt: batchParams.stateUpdatedAt }
+      : {}),
+    // v2 fence, primary frame only.
+    ...(isPrimaryFrame && batchParams?.expectedRunVersion !== undefined
+      ? { expectedRunVersion: batchParams.expectedRunVersion }
+      : {}),
+    ...(isPrimaryFrame && batchParams?.batchId !== undefined
+      ? { batchId: batchParams.batchId }
       : {}),
     occurredAt: new Date(),
     remoteRefBehavior,
@@ -846,8 +855,8 @@ export async function createWorkflowRunEventsBatch(
     createWorkflowRunEventsBatchV4(
       {
         runId,
-        events: events.map((event) =>
-          toBatchEventV4Input(runId, event, params)
+        events: events.map((event, i) =>
+          toBatchEventV4Input(runId, event, params, i === 0)
         ),
       },
       config
@@ -865,5 +874,12 @@ export async function createWorkflowRunEventsBatch(
       : undefined,
     cursor: delta?.cursor ?? undefined,
     hasMore: delta?.hasMore,
+    // v2 fence echo: the run's post-batch version, which the runtime stores as
+    // its next expectedRunVersion. Absent from a v1 server (undefined then).
+    // The server does not echo lastBatchId (it derives idempotency from the
+    // runVersion + the request batchId), so the runtime tracks it from batchId.
+    ...(result.runVersion !== undefined
+      ? { runVersion: result.runVersion }
+      : {}),
   };
 }

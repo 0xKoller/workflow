@@ -349,4 +349,126 @@ describe('createWorkflowRunEventsBatch adapter', () => {
     );
     agent.assertNoPendingInterceptors();
   });
+
+  // ---- v2 suspension-batch fence ----------------------------------------
+
+  const fenceTriple = [
+    {
+      eventType: 'step_completed' as const,
+      specVersion: 5,
+      correlationId: 'step_a',
+      eventData: { stepName: 'a', workflowName: 'wf', result: enc(1) },
+    },
+    {
+      eventType: 'step_created' as const,
+      specVersion: 5,
+      correlationId: 'step_b',
+      eventData: { stepName: 'b', workflowName: 'wf', input: enc(2) },
+    },
+    {
+      eventType: 'step_started' as const,
+      specVersion: 5,
+      correlationId: 'step_b',
+      eventData: { stepName: 'b', workflowName: 'wf' },
+    },
+  ];
+
+  it('v2 fence: carries expectedRunVersion + batchId on the primary frame ONLY, and decodes the top-level runVersion', async () => {
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    const captured: { frames?: ReturnType<typeof parseBatchFrames> } = {};
+    interceptBatch(
+      agent,
+      'wrun_1',
+      {
+        status: 200,
+        body: {
+          results: [
+            { step: {} },
+            { step: {} },
+            { step: {}, stepCreated: true },
+          ],
+          runVersion: 4,
+        },
+      },
+      captured
+    );
+
+    const out = await createWorkflowRunEventsBatch(
+      'wrun_1',
+      fenceTriple,
+      { expectedRunVersion: 3, batchId: 'bat_x' },
+      { token: 'test-token', dispatcher: agent }
+    );
+
+    const [completed, created, started] = captured.frames!;
+    // Fence rides on frame 0 (the primary) only — the server reads frameMetas[0].
+    expect(completed.meta.expectedRunVersion).toBe(3);
+    expect(completed.meta.batchId).toBe('bat_x');
+    expect(created.meta.expectedRunVersion).toBeUndefined();
+    expect(created.meta.batchId).toBeUndefined();
+    expect(started.meta.expectedRunVersion).toBeUndefined();
+    expect(started.meta.batchId).toBeUndefined();
+    // The server's post-batch runVersion is surfaced as the next fence value.
+    expect(out.runVersion).toBe(4);
+    agent.assertNoPendingInterceptors();
+  });
+
+  it('v2 fence: a 409 run-not-versioned surfaces as a plain WorkflowWorldError with the code (NOT EntityConflictError) for the permanent per-run latch', async () => {
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    agent
+      .get(ORIGIN)
+      .intercept({ path: '/api/v4/runs/wrun_1/events/batch', method: 'POST' })
+      .reply(
+        409,
+        JSON.stringify({
+          message: 'run not versioned',
+          code: 'run-not-versioned',
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    await createWorkflowRunEventsBatch(
+      'wrun_1',
+      oneCompleted,
+      { expectedRunVersion: 0, batchId: 'bat_y' },
+      { token: 'test-token', dispatcher: agent }
+    ).then(
+      () => expect.unreachable(),
+      (err) => {
+        // Distinguishable from the transient suspension-batch-conflict (also
+        // 409 → EntityConflictError): plain WorkflowWorldError carrying the code.
+        expect(err).toBeInstanceOf(WorkflowWorldError);
+        expect(err).not.toBeInstanceOf(EntityConflictError);
+        expect((err as WorkflowWorldError).code).toBe('run-not-versioned');
+        expect((err as WorkflowWorldError).status).toBe(409);
+      }
+    );
+    agent.assertNoPendingInterceptors();
+  });
+
+  it('v2 fence: a 409 suspension-batch-conflict stays an EntityConflictError (transient abandon+reinvoke)', async () => {
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    agent
+      .get(ORIGIN)
+      .intercept({ path: '/api/v4/runs/wrun_1/events/batch', method: 'POST' })
+      .reply(
+        409,
+        JSON.stringify({
+          message: 'run-version conflict',
+          code: 'suspension-batch-conflict',
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    await expect(
+      createWorkflowRunEventsBatch(
+        'wrun_1',
+        oneCompleted,
+        { expectedRunVersion: 1, batchId: 'bat_z' },
+        { token: 'test-token', dispatcher: agent }
+      )
+    ).rejects.toBeInstanceOf(EntityConflictError);
+    agent.assertNoPendingInterceptors();
+  });
 });
