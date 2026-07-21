@@ -65,6 +65,21 @@ export const WorkflowRunBaseSchema = z.object({
   workflowName: z.string(),
   // Optional in database for backwards compatibility, defaults to 1 (legacy) when reading
   specVersion: z.number().optional(),
+  /**
+   * v2 suspension-batch fence version. A monotonic counter the World/server
+   * advances by exactly one on every applied suspension batch (single-event
+   * writes leave it unchanged), used as the optimistic-concurrency fence for
+   * the whole batch (see {@link CreateBatchParams.expectedRunVersion}).
+   *
+   * `run_created` initializes it to `0`; the runtime reads it off the loaded
+   * run to seed the first batch's `expectedRunVersion` and advances its local
+   * copy from each {@link BatchEventResult.runVersion}. ABSENT (undefined) on
+   * runs created before v2 and on Worlds that don't implement the fence — the
+   * runtime treats an absent version as "this run cannot batch" and stays on
+   * the single-write path for the run's whole lifetime (pre-v2-ness is
+   * immutable, so every invocation re-derives the same decision).
+   */
+  runVersion: z.number().optional(),
   executionContext: z.record(z.string(), z.any()).optional(),
   input: SerializedDataSchema.optional(),
   output: SerializedDataSchema.optional(),

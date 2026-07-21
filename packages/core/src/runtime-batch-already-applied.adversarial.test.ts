@@ -22,8 +22,8 @@
 // This test asserts the FIXED behavior: step N+1's body does NOT run on an
 // already-applied result.
 
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import type { Event, WorkflowRun } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerStepFunction } from './private.js';
 import { setWorld } from './runtime/world.js';
@@ -112,6 +112,8 @@ describe('runtime batch already-applied (adversarial)', () => {
       updatedAt: new Date('2024-01-01T00:00:00.000Z'),
       startedAt: new Date('2024-01-01T00:00:00.000Z'),
       deploymentId: 'test-deployment',
+      // v2 fence: a versioned run so the batch path is eligible.
+      runVersion: 0,
     };
 
     const runningStep = (data: any, input?: unknown) => ({

@@ -30,6 +30,7 @@ import {
   type WorkflowRun,
   type World,
 } from '@workflow/world';
+import { ulid } from 'ulid';
 import {
   classifyRunError,
   isRetryableWorldError,
@@ -74,6 +75,7 @@ import {
   stepLeaseRemainingSeconds,
 } from './runtime/step-ownership.js';
 import { runStepSingleFlight } from './runtime/step-single-flight.js';
+import { assembleSuspensionBatch } from './runtime/suspension-batch.js';
 import { handleSuspension } from './runtime/suspension-handler.js';
 import { getWaitContinuationDispatch } from './runtime/wait-continuation.js';
 import {
@@ -579,6 +581,19 @@ export function workflowEntrypoint(
                   // of this invocation and fall back to the separate awaited
                   // POSTs. Reset per invocation (a fresh delivery re-probes).
                   let batchTransitionsDisabled = false;
+                  // v2 suspension-batch fence. `expectedRunVersion` is the
+                  // per-run monotonic version the runtime believes is current;
+                  // it is seeded once from the loaded run's `runVersion`
+                  // (`seedRunFence`) and advanced from each batch response's
+                  // `runVersion`. `batchDisabledForRun` is the PERMANENT per-run
+                  // latch (distinct from the per-invocation `batchTransitionsDisabled`
+                  // 404/405 latch): a run created before v2 has no `runVersion`,
+                  // so it can never batch — the whole invocation stays on the
+                  // single-write path, and every future invocation re-derives the
+                  // same decision because pre-v2-ness is immutable.
+                  let expectedRunVersion: number | undefined;
+                  let batchDisabledForRun = false;
+                  let runFenceSeeded = false;
                   // How many steps this invocation has executed inline. The
                   // first inline step stays on the existing path (its completion
                   // is written immediately, not deferred) — scope control — so
@@ -1751,6 +1766,18 @@ export function workflowEntrypoint(
                         // continue further down re-derives the same attr_set every
                         // iteration without ever committing the deferred completion
                         // → livelock → replay-budget run_failed.
+                        // Seed the v2 fence once per invocation from the loaded
+                        // run. A run with no `runVersion` predates v2 (or the
+                        // World doesn't implement the fence): latch batching off
+                        // for this run permanently — its version can never appear,
+                        // so a batch would only be rejected `run-not-versioned`.
+                        if (!runFenceSeeded) {
+                          runFenceSeeded = true;
+                          expectedRunVersion = workflowRun.runVersion;
+                          batchDisabledForRun =
+                            workflowRun.runVersion === undefined;
+                        }
+
                         const batchOpenState =
                           openHookAndWaitState(cachedEvents);
                         const batchTransitionCandidate =
@@ -1758,6 +1785,7 @@ export function workflowEntrypoint(
                           isBatchTransitionsEnabled() &&
                           typeof world.events.createBatch === 'function' &&
                           !batchTransitionsDisabled &&
+                          !batchDisabledForRun &&
                           !turbo &&
                           err.stepCount === 1 &&
                           err.hookCount === 0 &&
@@ -2260,6 +2288,7 @@ export function workflowEntrypoint(
                           isBatchTransitionsEnabled() &&
                           typeof world.events.createBatch === 'function' &&
                           !batchTransitionsDisabled &&
+                          !batchDisabledForRun &&
                           !turbo &&
                           inlineExecutions.length === 1 &&
                           lazyInlineSteps.length === 1 &&
@@ -2484,40 +2513,58 @@ export function workflowEntrypoint(
                         if (batchTransitionActive && pendingBatchTransition) {
                           const pending = pendingBatchTransition;
                           const only = inlineExecutions[0];
-                          const batchEvents: CreateEventRequest[] = [
-                            // step_completed(N) — the deferred terminal write,
-                            // carrying its result bytes + latency telemetry.
-                            pending.completedRequest,
-                            // step_created(N+1) — explicit (the batch does not
-                            // fold create into start the way the lazy single
-                            // POST does; the server folds create + start into a
-                            // born-running entity itself).
-                            {
-                              eventType: 'step_created',
-                              specVersion: SPEC_VERSION_CURRENT,
-                              correlationId: only.correlationId,
-                              eventData: {
-                                stepName: only.stepName,
-                                workflowName,
-                                input: only.lazyStepInput,
-                              },
-                            },
-                            // step_started(N+1) — the claim; server strips input.
-                            {
-                              eventType: 'step_started',
-                              specVersion: SPEC_VERSION_CURRENT,
-                              correlationId: only.correlationId,
-                              eventData: {
-                                stepName: only.stepName,
-                                workflowName,
-                                // Inline-ownership stamp — same as the lazy
-                                // step_started path (see executeStep).
-                                ...(metadata.messageId !== undefined
-                                  ? { ownerMessageId: metadata.messageId }
-                                  : {}),
-                              },
-                            },
-                          ];
+                          // Assemble this suspension's frames through the shared
+                          // grammar/budget builder so client and server agree on
+                          // order byte-for-byte. For the sequential single-step
+                          // transition this is exactly [step_completed(N),
+                          // step_created(N+1), step_started(N+1)] — the server
+                          // folds the created+started pair into a born-running
+                          // entity itself; the batch does not fold create into
+                          // start the way the lazy single POST does.
+                          const { events: batchEvents } =
+                            assembleSuspensionBatch({
+                              // step_completed(N) — the deferred terminal write,
+                              // carrying its result bytes + latency telemetry.
+                              leadingOutcome: pending.completedRequest,
+                              inlineSteps: [
+                                {
+                                  created: {
+                                    eventType: 'step_created',
+                                    specVersion: SPEC_VERSION_CURRENT,
+                                    correlationId: only.correlationId,
+                                    eventData: {
+                                      stepName: only.stepName,
+                                      workflowName,
+                                      input: only.lazyStepInput,
+                                    },
+                                  },
+                                  // step_started(N+1) — the claim; server strips
+                                  // input.
+                                  started: {
+                                    eventType: 'step_started',
+                                    specVersion: SPEC_VERSION_CURRENT,
+                                    correlationId: only.correlationId,
+                                    eventData: {
+                                      stepName: only.stepName,
+                                      workflowName,
+                                      // Inline-ownership stamp — same as the lazy
+                                      // step_started path (see executeStep).
+                                      ...(metadata.messageId !== undefined
+                                        ? { ownerMessageId: metadata.messageId }
+                                        : {}),
+                                    },
+                                  },
+                                },
+                              ],
+                            });
+                          // A fresh id per suspension attempt; reused across a
+                          // World's in-process transport retries so the server
+                          // recognizes an already-applied batch (lastBatchId ===
+                          // batchId → idempotent success). A NEW attempt (after a
+                          // reinvoke) gets a new id — cross-delivery idempotency
+                          // is handled by replay-from-durable-log + the runVersion
+                          // fence, not by a stable content hash.
+                          const batchId = `bat_${ulid()}`;
                           try {
                             // biome-ignore lint/style/noNonNullAssertion: batchTransitionActive implies createBatch is a function
                             const batchResult = await world.events.createBatch!(
@@ -2525,6 +2572,10 @@ export function workflowEntrypoint(
                               batchEvents,
                               {
                                 requestId,
+                                // v2 fence: batchDisabledForRun (gated above)
+                                // guarantees expectedRunVersion is a number here.
+                                expectedRunVersion,
+                                batchId,
                                 ...(pending.sinceCursor
                                   ? { sinceCursor: pending.sinceCursor }
                                   : {}),
@@ -2536,6 +2587,12 @@ export function workflowEntrypoint(
                               }
                             );
                             pendingBatchTransition = null;
+                            // Advance the local fence to the run's post-batch
+                            // version so the next batch in this invocation asserts
+                            // the right expectedRunVersion. Single-event writes
+                            // don't touch runVersion, so it only moves here.
+                            expectedRunVersion =
+                              batchResult.runVersion ?? expectedRunVersion;
                             // Seed step N+1 from the step_started result (the
                             // last frame), which carries the born-running entity
                             // and the create-claim signal.
@@ -2617,6 +2674,24 @@ export function workflowEntrypoint(
                               await flushDeferredBatchCompletion();
                               return await reinvoke(0);
                             }
+                            // Pre-v2 run (409 run-not-versioned): the run was
+                            // created before the fence existed, so it can never
+                            // batch. This is the backstop for the run-load seed
+                            // (a run whose loaded snapshot lacked runVersion);
+                            // latch batching off for this run PERMANENTLY (every
+                            // future invocation re-derives the same via the seed),
+                            // flush the still-pending completion on the single
+                            // path, and re-derive from a fresh replay. Distinct
+                            // from the transient 409 below: pre-v2-ness is
+                            // immutable, so there is nothing to retry.
+                            if (
+                              WorkflowWorldError.is(batchErr) &&
+                              batchErr.code === 'run-not-versioned'
+                            ) {
+                              batchDisabledForRun = true;
+                              await flushDeferredBatchCompletion();
+                              return await reinvoke(0);
+                            }
                             // Stale snapshot (412): the loaded view is behind an
                             // out-of-band event. Nothing written — abandon the
                             // deferred completion and re-invoke for a fresh
@@ -2627,11 +2702,16 @@ export function workflowEntrypoint(
                             }
                             // All-or-nothing conflict (409) or run-not-running
                             // (410): the run advanced elsewhere or the claim was
-                            // lost — nothing written. Abandon the deferred
-                            // completion and re-derive from a fresh replay of the
-                            // durable log (which observes whatever truly
-                            // happened and proceeds, mapping a lost step to the
-                            // existing skipped/terminal handling).
+                            // lost — nothing written. This covers the v2
+                            // suspension-batch-conflict (a lost step/wait claim,
+                            // a run-version mismatch, or run-not-running — the
+                            // World surfaces it as EntityConflictError/
+                            // RunExpiredError), all of which are transient races
+                            // resolved by replaying the durable log. Abandon the
+                            // deferred completion and re-derive from a fresh
+                            // replay (which observes whatever truly happened and
+                            // proceeds, mapping a lost step to the existing
+                            // skipped/terminal handling).
                             if (
                               EntityConflictError.is(batchErr) ||
                               RunExpiredError.is(batchErr)

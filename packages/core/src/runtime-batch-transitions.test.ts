@@ -79,6 +79,8 @@ async function driveRun(opts: {
   runId: string;
   withBatch: boolean;
   maxDeliveries?: number;
+  /** Omit runVersion from the run entity to model a run created before v2. */
+  preV2Run?: boolean;
   batchImpl?: (
     events: any[],
     durable: Event[],
@@ -109,6 +111,10 @@ async function driveRun(opts: {
     updatedAt: new Date('2024-01-01T00:00:00.000Z'),
     startedAt: new Date('2024-01-01T00:00:00.000Z'),
     deploymentId: 'test-deployment',
+    // v2 fence: a v2 run starts at version 0 (run_created seeds it). The
+    // runtime reads this off the loaded run to seed expectedRunVersion; a run
+    // WITHOUT runVersion (opts.preV2Run) latches batching off permanently.
+    ...(opts.preV2Run ? {} : { runVersion: 0 }),
   };
 
   const runningStep = (data: any, input?: unknown) => ({
@@ -195,6 +201,9 @@ async function driveRun(opts: {
         events: [...durable],
         cursor: `cursor-${durable.length}`,
         hasMore: false,
+        // v2 fence echo: the server sets runVersion to expected+1 on a fresh
+        // apply. The runtime advances its local copy to this for the next batch.
+        runVersion: (params.expectedRunVersion ?? 0) + 1,
       };
     }
   );
@@ -562,6 +571,69 @@ describe('runtime batch step transitions', () => {
     // abandoned the deferred completion and nacked (reinvoke) for a fresh
     // replay that observes the durable transition and applies ownership logic.
     expect(created.some((d) => d.eventType === 'run_completed')).toBe(false);
+    expect(created.some((d) => d.eventType === 'run_failed')).toBe(false);
+    expect(
+      returns.some(
+        (r) => r !== null && typeof r === 'object' && 'timeoutSeconds' in r
+      )
+    ).toBe(true);
+  });
+
+  // ---- v2 suspension-batch fence ----------------------------------------
+
+  it('v2 fence: the batch carries the run version (seeded 0) and a fresh bat_ batchId', async () => {
+    const { batchCalls } = await driveRun({
+      runId: 'wrun_batch_fence',
+      withBatch: true,
+    });
+    expect(batchCalls).toHaveLength(1);
+    // The run loaded at runVersion 0 (run_created seeds it), so the first
+    // batch of the invocation asserts expectedRunVersion 0.
+    expect(batchCalls[0].params?.expectedRunVersion).toBe(0);
+    // A unique per-attempt idempotency id in the reserved bat_ namespace.
+    expect(batchCalls[0].params?.batchId).toMatch(/^bat_[0-9A-HJKMNP-TV-Z]+$/);
+  });
+
+  it('pre-v2 run (no runVersion): latches batching off for the whole run, completes via single POSTs', async () => {
+    // A run created before the fence has no runVersion. The runtime reads that
+    // off the loaded run and never attempts a batch — permanently, since
+    // pre-v2-ness is immutable and every invocation re-derives the same seed.
+    const { created, createBatch } = await driveRun({
+      runId: 'wrun_batch_pre_v2',
+      withBatch: true,
+      preV2Run: true,
+    });
+    expect(createBatch).not.toHaveBeenCalled();
+    const ids = startedStepIds(created);
+    expect(ids).toHaveLength(3);
+    for (const id of ids) {
+      expect(startedFor(created, id)).toHaveLength(1);
+      expect(completedFor(created, id)).toHaveLength(1);
+    }
+    expect(created.some((d) => d.eventType === 'run_completed')).toBe(true);
+  });
+
+  it('run-not-versioned (409 backstop): flushes the deferred completion on the single path and nacks without failing the run', async () => {
+    // Backstop for a run whose loaded snapshot carried a runVersion but the
+    // server rejects the batch as unversioned. Unlike the transient 409 (which
+    // ABANDONS the deferred completion), the run-not-versioned latch FLUSHES it
+    // via the single path so nothing is dropped, then nacks for a fresh replay.
+    const { created, batchCalls, returns } = await driveRun({
+      runId: 'wrun_batch_not_versioned',
+      withBatch: true,
+      maxDeliveries: 1,
+      batchImpl: async () => {
+        throw new WorkflowWorldError('run not versioned', {
+          status: 409,
+          code: 'run-not-versioned',
+        });
+      },
+    });
+    expect(batchCalls).toHaveLength(1);
+    const deferredStep = batchCalls[0].events[0].correlationId!;
+    // Flushed (written), NOT abandoned — the distinguishing behavior from the
+    // transient 409 test above (which asserts length 0 here).
+    expect(completedFor(created, deferredStep)).toHaveLength(1);
     expect(created.some((d) => d.eventType === 'run_failed')).toBe(false);
     expect(
       returns.some(
