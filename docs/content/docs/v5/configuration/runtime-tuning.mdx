@@ -88,6 +88,17 @@ For example, a workflow can run a 10-minute inline step even with `WORKFLOW_REPL
 - How long after an inline step's latest `step_started` other invocations assume its owner may still be executing the body. Within the lease they defer the step's backstop message; past it they enqueue immediately.
 - Raise this on self-hosted multi-instance deployments whose inline steps run longer than the default (the default is sized for Vercel's function duration ceiling).
 
+### `WORKFLOW_BATCH_TRANSITIONS`
+
+- Default: enabled
+- Collapses a sequential step transition — completing step N and creating + starting the single next inline step N+1 — into one atomic batch write, instead of the two serialized round-trips (`step_completed` then `step_started`) it would otherwise take. The create-claim for N+1 commits together with N's completion, so there are strictly fewer intermediate crash states. This is not optimistic start: step N+1's body still runs only after its claim and start are durable.
+- Applies only on the non-turbo inline path and only for a lone next step with no open hook or wait; anything else transparently uses the separate writes.
+- Set `0` or `false` to disable. This is an **emergency kill switch**: it restores the exact prior two-write path (`step_completed` then `step_started`), byte-for-byte, mirroring the default-on + kill-switch shape of `WORKFLOW_TURBO`.
+
+<Callout type="warn">
+  `WORKFLOW_BATCH_TRANSITIONS` is **temporary**. It exists only as a rollback switch during the batch-transition burn-in and is planned for removal once the path has production mileage — it is not a long-term user-configurable option. Do not build deployment configuration around it.
+</Callout>
+
 ## Compression and tracing
 
 ### `WORKFLOW_DISABLE_COMPRESSION`
