@@ -63,7 +63,6 @@ import {
 } from './runtime/replay-budget.js';
 import { runIdCreatedAt } from './runtime/run-id-time.js';
 import { executeStep } from './runtime/step-executor.js';
-import { useQuickJSVm } from './runtime/vm-mode.js';
 import { computeStepLatencyTracking } from './runtime/step-latency.js';
 import {
   backstopIdempotencyKey,
@@ -73,6 +72,7 @@ import {
 } from './runtime/step-ownership.js';
 import { runStepSingleFlight } from './runtime/step-single-flight.js';
 import { handleSuspension } from './runtime/suspension-handler.js';
+import { useQuickJSVm } from './runtime/vm-mode.js';
 import { getWaitContinuationDispatch } from './runtime/wait-continuation.js';
 import {
   getWorld,
@@ -1147,6 +1147,7 @@ export function workflowEntrypoint(
                       preloadedEvents,
                       runInput,
                       parentSpan: span,
+                      deliveryAttempt: metadata.attempt,
                     });
                     if (quickjsResult?.timeoutSeconds !== undefined) {
                       // Use `reinvoke` rather than returning
