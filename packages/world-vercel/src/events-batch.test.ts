@@ -187,12 +187,28 @@ describe('createWorkflowRunEventsBatchV4 wire encoding', () => {
     const result = await createWorkflowRunEventsBatchV4(
       {
         runId: 'wrun_1',
+        // Three frames to match the three result bags the server returns (one
+        // per submitted frame, in order) — the client now enforces that 1:1.
         events: [
           {
             runId: 'wrun_1',
             eventType: 'step_completed',
             specVersion: 5,
             correlationId: 'step_a',
+          },
+          {
+            runId: 'wrun_1',
+            eventType: 'step_created',
+            specVersion: 5,
+            correlationId: 'step_b',
+            stepName: 'step-b',
+          },
+          {
+            runId: 'wrun_1',
+            eventType: 'step_started',
+            specVersion: 5,
+            correlationId: 'step_b',
+            stepName: 'step-b',
           },
         ],
       },
@@ -204,6 +220,76 @@ describe('createWorkflowRunEventsBatchV4 wire encoding', () => {
     expect(result.eventsDelta?.cursor).toBe('eid:evnt_3');
     expect(result.eventsDelta?.hasMore).toBe(false);
     expect(result.eventsDelta?.events).toHaveLength(1);
+    agent.assertNoPendingInterceptors();
+  });
+
+  // A 200 MUST carry exactly one materialized-entity bag per submitted frame.
+  // The runtime indexes `results` positionally (the started frame's result is
+  // the create-claim owner), so a missing / non-array / short `results` is a
+  // server protocol violation that must fail LOUDLY rather than silently
+  // coerce to `[]` (which would masquerade as "all frames unstamped" and
+  // degrade into an opaque no-body reinvoke loop).
+  const twoFrameBatch = {
+    runId: 'wrun_1',
+    events: [
+      {
+        runId: 'wrun_1',
+        eventType: 'step_completed',
+        specVersion: 5,
+        correlationId: 'step_a',
+      },
+      {
+        runId: 'wrun_1',
+        eventType: 'step_created',
+        specVersion: 5,
+        correlationId: 'step_b',
+        stepName: 'step-b',
+      },
+    ],
+  } as const;
+
+  it.each([
+    ['a missing `results` field', {}],
+    ['a non-array `results` field', { results: 'nope' }],
+    ['a short `results` array (fewer than submitted frames)', { results: [{}] }],
+    ['a long `results` array (more than submitted frames)', {
+      results: [{}, {}, {}],
+    }],
+    ['an empty response body', undefined],
+  ])(
+    'rejects %s on a 200 with a typed protocol error (does not silently return [])',
+    async (_label, body) => {
+      const agent = new MockAgent();
+      agent.disableNetConnect();
+      const captured = {};
+      interceptBatch(agent, 'wrun_1', { status: 200, body }, captured);
+
+      await expect(
+        createWorkflowRunEventsBatchV4(twoFrameBatch, {
+          token: 'test-token',
+          dispatcher: agent,
+        })
+      ).rejects.toThrow(/results.*length|malformed response/i);
+      agent.assertNoPendingInterceptors();
+    }
+  );
+
+  it('accepts a 200 whose `results` length exactly equals the submitted frame count', async () => {
+    const agent = new MockAgent();
+    agent.disableNetConnect();
+    const captured = {};
+    interceptBatch(
+      agent,
+      'wrun_1',
+      { status: 200, body: { results: [{ step: {} }, { step: {} }] } },
+      captured
+    );
+
+    const out = await createWorkflowRunEventsBatchV4(twoFrameBatch, {
+      token: 'test-token',
+      dispatcher: agent,
+    });
+    expect(out.results).toHaveLength(2);
     agent.assertNoPendingInterceptors();
   });
 });

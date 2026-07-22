@@ -525,9 +525,25 @@ export async function createWorkflowRunEventsBatchV4(
           runVersion?: number;
         })
       : {};
-  const results = Array.isArray(decoded.results)
-    ? (decoded.results as CreateEventV4Result['body'][])
-    : [];
+  // A 200 MUST carry exactly one materialized-entity bag per submitted frame,
+  // in request order — the runtime indexes `results` positionally (the started
+  // frame's result is the create-claim owner). A missing / non-array / short
+  // `results` is a server protocol violation; silently coercing it to `[]` (or
+  // any short array) would masquerade as "all frames unstamped" and degrade
+  // into an opaque no-body reinvoke loop that hides the server bug. Fail
+  // loudly instead — createBatch is idempotent (fenced by `batchId`), so the
+  // read is safe for the caller to retry. Mirrors the truncated-LIST guard.
+  if (
+    !Array.isArray(decoded.results) ||
+    decoded.results.length !== input.events.length
+  ) {
+    throw new Error(
+      `v4 createEventBatch: response \`results\` length ` +
+        `(${Array.isArray(decoded.results) ? decoded.results.length : 'non-array'}) ` +
+        `!= ${input.events.length} submitted frames — malformed response?`
+    );
+  }
+  const results = decoded.results as CreateEventV4Result['body'][];
   return {
     results,
     ...(decoded.eventsDelta ? { eventsDelta: decoded.eventsDelta } : {}),
