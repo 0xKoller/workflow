@@ -1204,13 +1204,45 @@ export function workflowEntrypoint(
                   // throwaway replay array.
                   const buildSyntheticCompleted = (
                     request: CreateEventRequest
-                  ): Event =>
-                    ({
+                  ): Event => {
+                    // Replay determinism: the workflow VM advances its clock to
+                    // each consumed event's `createdAt` (workflow.ts
+                    // onConsumedEvent → updateTimestamp, a plain set). This
+                    // synthetic is appended AFTER `cachedEvents`, so it is the
+                    // last event consumed before the inter-step user code runs.
+                    // A wall-clock `new Date()` here would make clock-dependent
+                    // control flow between step N and step N+1 observe a
+                    // timestamp that differs from the server-canonical
+                    // `createdAt` the DURABLE step_completed(N) receives at batch
+                    // commit — a value all LATER replays advance to — which can
+                    // change which durable commands the VM emits and trigger
+                    // ReplayDivergenceError. That durable value is not
+                    // client-predictable (workflow-server derives an event's
+                    // `createdAt` from a server-minted event ULID; see
+                    // electrodb.ts / Ulid.toDate). The replay-stable choice is to
+                    // NOT perturb the clock past the last durable event we
+                    // already consumed (step_started(N)): reusing its `createdAt`
+                    // makes consuming the synthetic a clock no-op and strips all
+                    // wall-clock entropy from the committing invocation. A
+                    // residual gap vs the server value remains (the durable
+                    // completion lands a few ms later) and can only be fully
+                    // closed by a deterministic server-side createdAt for the
+                    // batched completion — tracked as a workflow-server
+                    // follow-up.
+                    const lastDurable =
+                      cachedEvents && cachedEvents.length > 0
+                        ? cachedEvents[cachedEvents.length - 1]
+                        : undefined;
+                    const createdAt = lastDurable
+                      ? lastDurable.createdAt
+                      : new Date(runIdCreatedAt(runId) ?? Date.now());
+                    return {
                       ...request,
                       runId,
                       eventId: `evnt_synthetic_${request.correlationId ?? 'step'}`,
-                      createdAt: new Date(),
-                    }) as Event;
+                      createdAt,
+                    } as Event;
+                  };
 
                   // Batch transitions: flush a deferred completion via the
                   // single-event path when the transition can't be batched
