@@ -103,6 +103,8 @@ export {
   PaginatedResponseSchema,
   StructuredErrorSchema,
 } from './shared.js';
+export type * from './snapshots.js';
+export { SnapshotMetadataSchema } from './snapshots.js';
 export type { SpecVersion } from './spec-version.js';
 export {
   isLegacySpecVersion,
@@ -122,6 +124,7 @@ export {
   TERMINAL_STEP_STATUSES,
   TerminalStepStatusSchema,
 } from './steps.js';
+export type { WorkflowRunId } from './ulid.js';
 export {
   DEFAULT_TIMESTAMP_THRESHOLD_FUTURE_MS,
   DEFAULT_TIMESTAMP_THRESHOLD_MS,
@@ -130,6 +133,5 @@ export {
   validateUlidTimestamp,
   workflowRunIdSchema,
 } from './ulid.js';
-export type { WorkflowRunId } from './ulid.js';
 export type * from './waits.js';
 export { WaitSchema, WaitStatusSchema } from './waits.js';
