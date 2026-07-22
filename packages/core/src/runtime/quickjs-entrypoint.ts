@@ -16,6 +16,7 @@
 import type { Span } from '@opentelemetry/api';
 import {
   EntityConflictError,
+  MaxEventsExceededError,
   RunExpiredError,
   WorkflowNotRegisteredError,
 } from '@workflow/errors';
@@ -408,6 +409,14 @@ export async function runWorkflowWithQuickJS(params: {
    * to it for end-to-end visibility.
    */
   parentSpan?: Span;
+  /**
+   * Server-supplied per-run event ceiling from the run_started response
+   * (undefined ⇒ no enforcement). Mirrors the node:vm engine's guard:
+   * a runaway run is failed once its log reaches the ceiling. The throw
+   * propagates to the queue handler's catch, which records run_failed
+   * with MAX_EVENTS_EXCEEDED.
+   */
+  maxEventsLimit?: number;
 }): Promise<{ timeoutSeconds?: number } | void> {
   const {
     workflowCode,
@@ -416,6 +425,7 @@ export async function runWorkflowWithQuickJS(params: {
     preloadedEvents,
     runInput,
     parentSpan,
+    maxEventsLimit,
   } = params;
   const world = await getWorld();
   const runId = workflowRun.runId;
@@ -500,6 +510,13 @@ export async function runWorkflowWithQuickJS(params: {
     }
 
     events = allEvents;
+  }
+
+  // Event-limit guard: fail a runaway run once its log reaches the
+  // server-supplied ceiling — same enforcement point as the node:vm
+  // engine's replay loop.
+  if (maxEventsLimit !== undefined && events.length >= maxEventsLimit) {
+    throw new MaxEventsExceededError(events.length, maxEventsLimit);
   }
 
   parentSpan?.setAttributes({

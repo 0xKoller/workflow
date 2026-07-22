@@ -761,5 +761,9 @@ async function createWorkflowRunEventInner(
     // signal through so the owned-inline runtime path can gate body execution
     // on it. Absent from older servers → undefined → safe default.
     ...(body.stepCreated ? { stepCreated: true } : {}),
+    // Server-supplied per-run event ceiling; absent from older servers.
+    ...(typeof body.maxEvents === 'number'
+      ? { maxEvents: body.maxEvents }
+      : {}),
   };
 }

@@ -805,6 +805,8 @@ export interface EventResult {
    * the safe default (treated as "not the lazy creator").
    */
   stepCreated?: boolean;
+  /** Server-owned max event count for the run (run-lifecycle responses); the runtime enforces it. */
+  maxEvents?: number;
 }
 
 export interface GetEventParams {

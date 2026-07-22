@@ -3,6 +3,7 @@ import {
   CorruptedEventLogError,
   EntityConflictError,
   FatalError,
+  MaxEventsExceededError,
   PreconditionFailedError,
   ReplayDivergenceError,
   RUN_ERROR_CODES,
@@ -37,6 +38,7 @@ import { type StepInvocationQueueItem, WorkflowSuspension } from './global.js';
 import { runtimeLogger } from './logger.js';
 import { ReplayPayloadCache } from './replay-payload-cache.js';
 import {
+  getMaxEventsOverride,
   getMaxQueueDeliveries,
   getReplayDivergenceMaxRetries,
   isInlineOwnershipEnabled,
@@ -62,7 +64,11 @@ import {
   ReplayBudget,
 } from './runtime/replay-budget.js';
 import { runIdCreatedAt } from './runtime/run-id-time.js';
-import { executeStep } from './runtime/step-executor.js';
+import {
+  DEFAULT_STEP_MAX_RETRIES,
+  executeStep,
+} from './runtime/step-executor.js';
+import { getStepFunction } from './private.js';
 import { useQuickJSVm } from './runtime/vm-mode.js';
 import { computeStepLatencyTracking } from './runtime/step-latency.js';
 import {
@@ -148,6 +154,20 @@ export {
   setWorld,
   type WorldFactoryModule,
 } from './runtime/world.js';
+
+/**
+ * Apply the optional client-side event-limit override.
+ * `WORKFLOW_MAX_EVENTS_OVERRIDE`, when set to a positive integer, clamps the
+ * server-supplied per-run event ceiling to a smaller value so enforcement can
+ * be exercised without a server-side change. Clamp-down only: it never raises
+ * the server's limit, and it takes effect even when the server returns none.
+ * Unset ⇒ server value passes through unchanged.
+ */
+function clampMaxEvents(serverValue: number | undefined): number | undefined {
+  const override = getMaxEventsOverride();
+  if (override === undefined) return serverValue;
+  return serverValue === undefined ? override : Math.min(serverValue, override);
+}
 
 function getWorkflowSetupErrorCode(err: unknown): RunErrorCode | null {
   if (WorkflowRuntimeError.is(err)) {
@@ -246,6 +266,29 @@ function hasRecordedTerminalRunEvent(events: Event[], runId: string): boolean {
     eventId: terminalRunEvent.eventId,
   });
   return true;
+}
+
+/**
+ * Number of `step_started` events already recorded for a step, used as the
+ * authoritative attempt count for the inline retry ceiling. Each real attempt
+ * writes exactly one `step_started` (the atomic create-claim / single-flight
+ * prevents concurrent double-starts from inflating this), so the count equals
+ * the number of attempts that have begun.
+ */
+function countStepStartedEvents(
+  events: Event[] | null | undefined,
+  stepId: string
+): number {
+  if (!events) {
+    return 0;
+  }
+  let count = 0;
+  for (const e of events) {
+    if (e.eventType === 'step_started' && e.correlationId === stepId) {
+      count++;
+    }
+  }
+  return count;
 }
 
 /**
@@ -553,6 +596,9 @@ export function workflowEntrypoint(
                   // Shared state: set by either the background step path
                   // or the run_started setup below.
                   let workflowRun: WorkflowRun | undefined;
+                  // Server-supplied per-run event ceiling from the run_started
+                  // response. Undefined ⇒ no enforcement (older servers, turbo).
+                  let maxEventsLimit: number | undefined;
                   let workflowStartedAt = -1;
                   let preloadedEvents: Event[] | undefined;
                   let preloadedEventsCursor: string | null | undefined;
@@ -722,6 +768,38 @@ export function workflowEntrypoint(
                       const bgStartedAt = bgRun.startedAt
                         ? +bgRun.startedAt
                         : Date.now();
+
+                      // Retry ceiling for a backgrounded step. `metadata.attempt`
+                      // (the queue delivery count) is a cheap upper bound, but it
+                      // over-counts: a ThrottleError / TooEarlyError — or any
+                      // redelivery that never ran the body — still advances it, so
+                      // trusting it directly could fail a step as "exceeded max
+                      // retries" before the body ever ran (a user-visible
+                      // regression under transient backend pressure). Use it only
+                      // as a fast gate: while it is at or under the ceiling the
+                      // step cannot be exhausted, so proceed without touching the
+                      // log. Only once it crosses the ceiling do we load the full
+                      // event log and derive the authoritative attempt from the
+                      // recorded `step_started` count — the count only real
+                      // attempts write, so throttle/too-early redeliveries are
+                      // excluded. This still bounds timeouts, which write no error
+                      // for the post-body guard to catch. The load also primes the
+                      // replay's `cachedEvents`/`eventsCursor` (the post-step
+                      // continuation below refreshes them once the step's terminal
+                      // event lands).
+                      let bgAuthoritativeAttempt = metadata.attempt;
+                      const bgMaxRetries =
+                        getStepFunction(incomingStepName)?.maxRetries ??
+                        DEFAULT_STEP_MAX_RETRIES;
+                      if (metadata.attempt > bgMaxRetries + 1) {
+                        const loaded = await loadWorkflowRunEvents(runId);
+                        cachedEvents = loaded.events;
+                        eventsCursor = loaded.cursor;
+                        bgAuthoritativeAttempt =
+                          countStepStartedEvents(cachedEvents, incomingStepId) +
+                          1;
+                      }
+
                       // Pause the replay budget while the step body runs —
                       // step duration is bounded by the platform's function
                       // maxDuration, not by the replay timeout. See the
@@ -753,6 +831,10 @@ export function workflowEntrypoint(
                               stepId: incomingStepId,
                               stepName: incomingStepName,
                               runSpecVersion: bgRun.specVersion,
+                              // Retry ceiling: the queue delivery count as a fast
+                              // gate, verified against the recorded step_started
+                              // count once it crosses the ceiling (see above).
+                              authoritativeAttempt: bgAuthoritativeAttempt,
                             })
                         );
                       } finally {
@@ -975,6 +1057,19 @@ export function workflowEntrypoint(
                         { requestId, skipPreload: true }
                       );
                       runReadyBarrier = startedPromise;
+                      // Turbo backgrounds run_started, so the non-turbo assignment
+                      // below never runs — thread the per-run event ceiling off the
+                      // backgrounded response here instead. The guard re-checks
+                      // maxEventsLimit every loop iteration, so a value that lands
+                      // shortly after start still enforces well before a runaway
+                      // log approaches the ceiling.
+                      startedPromise.then(
+                        (r) => {
+                          const limit = clampMaxEvents(r?.maxEvents);
+                          if (limit !== undefined) maxEventsLimit = limit;
+                        },
+                        () => {}
+                      );
                       // Attach a no-op rejection handler so an early failure
                       // never surfaces as an unhandledRejection before a consumer
                       // (await/then) is attached; consumers still observe it.
@@ -1038,6 +1133,7 @@ export function workflowEntrypoint(
                           );
                         }
                         workflowRun = result.run;
+                        maxEventsLimit = clampMaxEvents(result.maxEvents);
                         // Anchors RSFS — see the declaration above.
                         runStartedReceivedAtMs = Date.now();
 
@@ -1147,6 +1243,7 @@ export function workflowEntrypoint(
                       preloadedEvents,
                       runInput,
                       parentSpan: span,
+                      maxEventsLimit,
                     });
                     if (quickjsResult?.timeoutSeconds !== undefined) {
                       // Use `reinvoke` rather than returning
@@ -1465,6 +1562,20 @@ export function workflowEntrypoint(
                       // delivery is done.
                       if (hasRecordedTerminalRunEvent(events, runId)) {
                         return;
+                      }
+
+                      // Event-limit guard: fail a runaway run once its log
+                      // reaches the server-supplied ceiling (undefined ⇒ no
+                      // enforcement). The throw is caught below and written as
+                      // run_failed / MAX_EVENTS_EXCEEDED.
+                      if (
+                        maxEventsLimit !== undefined &&
+                        events.length >= maxEventsLimit
+                      ) {
+                        throw new MaxEventsExceededError(
+                          events.length,
+                          maxEventsLimit
+                        );
                       }
 
                       // Update cache reference (may have been set for first time)
@@ -2287,6 +2398,25 @@ export function workflowEntrypoint(
                                 stepId: s.correlationId,
                                 stepName: s.stepName,
                                 runSpecVersion: workflowRun.specVersion,
+                                // Attempt number = prior step_started count + 1
+                                // (this execution's start). A lazy step is
+                                // brand-new by construction (it enters the batch
+                                // only when it has no step_created yet), so it
+                                // has zero prior starts and is always attempt 1 —
+                                // skip the log scan entirely. Only an
+                                // owned-recovery re-run (this message re-executing
+                                // a step it crashed/timed out on) can have prior
+                                // starts, and that path is uncommon, so reserve
+                                // the O(n) scan for it rather than walking the
+                                // growing log for every inline step (which would
+                                // be O(n²) across a long sequential workflow).
+                                authoritativeAttempt:
+                                  s.lazyStepInput !== undefined
+                                    ? 1
+                                    : countStepStartedEvents(
+                                        cachedEvents,
+                                        s.correlationId
+                                      ) + 1,
                                 // Lazy inline start: send the deferred step's
                                 // input on step_started so the world creates
                                 // the step on the fly. Absent for
