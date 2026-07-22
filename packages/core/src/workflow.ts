@@ -24,6 +24,7 @@ import { ReplayPayloadCache } from './replay-payload-cache.js';
 import { getPortLazy } from './runtime/get-port-lazy.js';
 import { runIdCreatedAt } from './runtime/run-id-time.js';
 import { handleSuspension } from './runtime/suspension-handler.js';
+import { registerSerializationPins } from './runtime/retained-step-input.js';
 import { getWorld } from './runtime/world.js';
 import {
   dehydrateWorkflowReturnValue,
@@ -1026,8 +1027,11 @@ async function createWorkflowSession({
   // is rare (it requires the lookup `?.get(...)` expression to throw) and
   // does not affect the workflow function or replay determinism.
   // All SDK globals are installed; pin the serialization-consulted
-  // intrinsics before any workflow code can run.
+  // intrinsics before any workflow code can run, then capture the
+  // serialization pins the retained-input gate re-verifies per boundary
+  // (see runtime/retained-step-input.ts).
   freezeSerializationIntrinsics(vmGlobalThis);
+  registerSerializationPins(vmGlobalThis);
 
   runCachedWorkflowScript(workflowCode, filename, context);
   const workflowFn = runCachedWorkflowScript(

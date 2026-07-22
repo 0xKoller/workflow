@@ -100,6 +100,55 @@ const mixedBatchWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP"
   }
   globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
 
+// Map/Date/typed-array arguments serialize through pinned prototype members
+// (see runtime/retained-step-input.ts), so these boundaries stay retainable.
+const builtinArgsWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
+  async function workflow() {
+    const a = await s1({ index: new Map([["k", 1]]), when: new Date(1234) });
+    const b = await s2(new Uint8Array([1, 2, 3]));
+    return a + b;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
+// The Temporal / core-js pattern: polyfills add new data-valued methods to
+// built-in prototypes and constructor statics. Serialization never reads
+// them, so retention is unaffected.
+const polyfillArgsWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
+  Date.prototype.toTemporalInstant = function () { return "instant"; };
+  Set.prototype.union = function (other) { return new Set([...this, ...other]); };
+  Object.groupBy = function () { return {}; };
+  async function workflow() {
+    const a = await s1(new Date(1234));
+    const b = await s2(new Set([1, 2]));
+    return a + b;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
+// Replacing a member serialization executes (Date reducer calls getDate /
+// toISOString — serialization/reducers/common.ts:184-188) declines retention
+// for boundaries passing that type; converting to a string first retains.
+const patchedDateArgWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
+  Date.prototype.toISOString = function () { return "patched"; };
+  async function workflow() {
+    const a = await s1(new Date(1234));
+    const b = await s2();
+    return a + b;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
+const patchedDateStringArgWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
+  Date.prototype.toISOString = function () { return "patched"; };
+  async function workflow() {
+    const a = await s1(new Date(1234).toISOString());
+    const b = await s2();
+    return a + b;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
 // `crypto.subtle.digest` computes synchronously via node:crypto, so a
 // digest-using VM stays quiescent at suspension and remains retainable.
 const digestWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
@@ -317,6 +366,42 @@ describe('retained VM through the inline replay loop', () => {
     );
     expect(output).toBeInstanceOf(Uint8Array);
     expect(vmBuilds).toBeGreaterThan(1);
+  });
+
+  it('retains boundaries whose args are supported built-ins', async () => {
+    const { vmBuilds, output } = await drive(
+      'wrun_retained_builtins',
+      builtinArgsWorkflow
+    );
+    expect(output).toBeInstanceOf(Uint8Array);
+    expect(vmBuilds).toBe(1);
+  });
+
+  it('retains boundaries when prototypes carry polyfilled data methods', async () => {
+    const { vmBuilds, output } = await drive(
+      'wrun_retained_polyfill',
+      polyfillArgsWorkflow
+    );
+    expect(output).toBeInstanceOf(Uint8Array);
+    expect(vmBuilds).toBe(1);
+  });
+
+  it('demotes a Date arg when an executed serialization member is replaced', async () => {
+    const { vmBuilds, output } = await drive(
+      'wrun_retained_patched_date',
+      patchedDateArgWorkflow
+    );
+    expect(output).toBeInstanceOf(Uint8Array);
+    expect(vmBuilds).toBeGreaterThan(1);
+  });
+
+  it('retains when the patched type is converted to a string first', async () => {
+    const { vmBuilds, output } = await drive(
+      'wrun_retained_patched_date_string',
+      patchedDateStringArgWorkflow
+    );
+    expect(output).toBeInstanceOf(Uint8Array);
+    expect(vmBuilds).toBe(1);
   });
 
   it('retains a VM that used the synchronous crypto.subtle.digest', async () => {

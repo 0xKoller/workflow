@@ -1,4 +1,5 @@
 import type { Span } from '@opentelemetry/api';
+import { isRetainedSerializationPassive } from './retained-step-input.js';
 import {
   EntityConflictError,
   FatalError,
@@ -31,19 +32,6 @@ import * as Attribute from '../telemetry/semantic-conventions.js';
 import { getAbortStreamIdFromToken } from '../util.js';
 import { getMaxInlineSteps } from './constants.js';
 import { type MutableEventLog, withPreconditionRetry } from './helpers.js';
-
-// Serializing a primitive executes no code of any kind. BigInt is excluded:
-// its encoding calls a prototype method. Widened to plain data and standard
-// built-ins by the retained-input walker in a follow-up.
-function isPrimitiveStepArgument(value: unknown): boolean {
-  return (
-    value === null ||
-    value === undefined ||
-    typeof value === 'boolean' ||
-    typeof value === 'number' ||
-    typeof value === 'string'
-  );
-}
 
 export interface SuspensionHandlerParams {
   suspension: WorkflowSuspension;
@@ -514,19 +502,22 @@ export async function handleSuspension({
   // durable bytes cannot depend on retention. What retention needs to know is
   // whether that serialization will execute workflow code (getters, hooks,
   // patched prototype members) — side effects a cold replay would not repeat.
-  // For now only primitive arguments are provably passive (serializing them
-  // executes no code at all); a follow-up widens this to plain data and the
-  // standard built-ins. If any input in the batch is not provably passive,
-  // the caller demotes the session so the side effects land in a VM that is
-  // about to be discarded, exactly like the pre-retention runtime.
+  // If any input in the batch is not provably passive, the caller demotes
+  // the session so the side effects land in a VM that is about to be
+  // discarded, exactly like the pre-retention runtime.
   let retainedStepInputsSafe = true;
   if (prepareForRetention) {
     for (const queueItem of stepItems) {
       if (!stepsNeedingCreation.has(queueItem.correlationId)) continue;
       if (
-        queueItem.thisVal !== undefined ||
-        queueItem.closureVars !== undefined ||
-        !queueItem.args.every(isPrimitiveStepArgument)
+        !isRetainedSerializationPassive(
+          {
+            args: queueItem.args,
+            closureVars: queueItem.closureVars,
+            thisVal: queueItem.thisVal,
+          },
+          suspension.globalThis
+        )
       ) {
         retainedStepInputsSafe = false;
         break;
