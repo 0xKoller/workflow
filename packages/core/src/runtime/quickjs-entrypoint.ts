@@ -239,7 +239,7 @@ async function dispatchPendingOps(params: {
               if (result.event?.eventType === 'hook_conflict') {
                 await queueMessage(
                   world,
-                  `__wkf_workflow_${workflowRun.workflowName}`,
+                  getWorkflowQueueName(workflowRun.workflowName),
                   {
                     runId,
                   },
