@@ -1,0 +1,622 @@
+diff --git a/index.js b/index.js
+index 86e3a2dcae942f79b02da1e9c5fe2f6390b8b487..427a24b076f00237a6ff9b2d0fdbd3fd3292c6d7 100644
+--- a/index.js
++++ b/index.js
+@@ -1,4 +1,5 @@
+ export { uneval } from './src/uneval.js';
+ export { parse, unflatten } from './src/parse.js';
+ export { stringify, stringifyAsync } from './src/stringify.js';
++export { default_operations as defaultOperations } from './src/operations.js';
+ export { DevalueError } from './src/utils.js';
+diff --git a/src/operations.js b/src/operations.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..03ffe62973c7a529f814e2ffe6433329cc4b8d8a
+--- /dev/null
++++ b/src/operations.js
+@@ -0,0 +1,82 @@
++import {
++	enumerable_symbols,
++	get_type,
++	is_plain_object,
++	valid_array_indices
++} from './utils.js';
++
++/** @type {{ kind: 'not-plain' }} */
++const NOT_PLAIN = Object.freeze({ kind: 'not-plain' });
++
++/** @type {{ kind: 'symbol-keys' }} */
++const SYMBOL_KEYS = Object.freeze({ kind: 'symbol-keys' });
++
++/**
++ * The default implementations of every introspection/extraction operation
++ * `stringify` performs on the value being serialized. Each one uses native
++ * JavaScript semantics (property access, iteration, prototype methods, etc).
++ *
++ * Pass overrides via the `operations` option of `stringify`/`stringifyAsync`
++ * to customize how values are inspected — e.g. to serialize values without
++ * triggering getters, proxy traps, or patched prototype methods, or to
++ * serialize values that live in a different JavaScript runtime (a `node:vm`
++ * context, a WASM-hosted engine, a remote process) through handle objects.
++ *
++ * The object is frozen — it is shared by every `stringify` call that does
++ * not override a given operation.
++ *
++ * @type {import('./types.js').StringifyOperations}
++ */
++export const default_operations = Object.freeze({
++	identify: (value) => value,
++
++	typeOf: (value) => (value === null ? 'null' : typeof value),
++
++	primitive: (value) => value,
++
++	tag: (value) => get_type(value),
++
++	isThenable: (value) => typeof value.then === 'function',
++
++	resolveThenable: (value) => Promise.resolve(value),
++
++	unbox: (value) => value.valueOf(),
++
++	dateISO: (value) => (isNaN(value.getDate()) ? '' : value.toISOString()),
++
++	toStringValue: (value) => value.toString(),
++
++	regExp: (value) => ({ source: value.source, flags: value.flags }),
++
++	setValues: (value) => value,
++
++	mapEntries: (value) => value,
++
++	viewInfo: (value) => ({
++		buffer: value.buffer,
++		byteOffset: value.byteOffset,
++		byteLength: value.byteLength,
++		length: value.length,
++		bufferByteLength: value.buffer.byteLength
++	}),
++
++	arrayBuffer: (value) => value,
++
++	arrayLength: (value) => value.length,
++
++	hasOwnIndex: (value, index) => Object.hasOwn(value, index),
++
++	arrayIndices: (value) => valid_array_indices(value),
++
++	objectShape: (value) => {
++		if (!is_plain_object(value)) return NOT_PLAIN;
++		if (enumerable_symbols(value).length > 0) return SYMBOL_KEYS;
++
++		return {
++			kind: Object.getPrototypeOf(value) === null ? 'null-proto' : 'plain',
++			keys: Object.keys(value)
++		};
++	},
++
++	get: (value, key) => value[key]
++});
+diff --git a/src/stringify.js b/src/stringify.js
+index 35dadffb9b8140180957cfe3d8a950acbf5d4a5c..2051d0c2fe2a58492a5fa88d76a239775afe19a4 100644
+--- a/src/stringify.js
++++ b/src/stringify.js
+@@ -1,13 +1,4 @@
+-import {
+-	DevalueError,
+-	enumerable_symbols,
+-	get_type,
+-	is_plain_object,
+-	is_primitive,
+-	stringify_key,
+-	stringify_string,
+-	valid_array_indices
+-} from './utils.js';
++import { DevalueError, stringify_key, stringify_string } from './utils.js';
+ import {
+ 	HOLE,
+ 	NAN,
+@@ -18,14 +9,16 @@ import {
+ 	UNDEFINED
+ } from './constants.js';
+ import { encode64 } from './base64.js';
++import { default_operations } from './operations.js';
+ 
+ /**
+  * Turn a value into a JSON string that can be parsed with `devalue.parse`
+  * @param {any} value
+  * @param {Record<string, (value: any) => any>} [reducers]
++ * @param {import('./types.js').StringifyOptions} [options]
+  */
+-export function stringify(value, reducers) {
+-	const stringified = run(false, value, reducers);
++export function stringify(value, reducers, options) {
++	const stringified = run(false, value, reducers, options);
+ 	return typeof stringified === 'string' ? stringified : `[${stringified.join(',')}]`;
+ }
+ 
+@@ -33,9 +26,10 @@ export function stringify(value, reducers) {
+  * Turn a value into a JSON string that can be parsed with `devalue.parse`
+  * @param {any} value
+  * @param {Record<string, (value: any) => any>} [reducers]
++ * @param {import('./types.js').StringifyOptions} [options]
+  */
+-export async function stringifyAsync(value, reducers) {
+-	const stringified = run(true, value, reducers);
++export async function stringifyAsync(value, reducers, options) {
++	const stringified = run(true, value, reducers, options);
+ 
+ 	if (typeof stringified === 'string') {
+ 		return stringified;
+@@ -71,8 +65,23 @@ export async function stringifyAsync(value, reducers) {
+  * @param {boolean} async
+  * @param {any} value
+  * @param {Record<string, (value: any) => any>} [reducers]
++ * @param {import('./types.js').StringifyOptions} [options]
+  */
+-function run(async, value, reducers) {
++function run(async, value, reducers, options) {
++	/** @type {import('./types.js').StringifyOperations} */
++	let ops = default_operations;
++
++	if (options?.operations) {
++		ops = { ...default_operations };
++
++		// treat explicitly-`undefined` members like omitted members, so that
++		// programmatically-built overrides can't clobber a default with undefined
++		for (const key of /** @type {(keyof typeof ops)[]} */ (Object.keys(options.operations))) {
++			const fn = options.operations[key];
++			if (fn !== undefined) ops[key] = /** @type {any} */ (fn);
++		}
++	}
++
+ 	/** @type {any[]} */
+ 	const stringified = [];
+ 
+@@ -97,16 +106,27 @@ function run(async, value, reducers) {
+ 	 * @param {number} [index]
+ 	 */
+ 	function flatten(thing, index) {
+-		if (thing === undefined) return UNDEFINED;
+-		if (Number.isNaN(thing)) return NAN;
+-		if (thing === Infinity) return POSITIVE_INFINITY;
+-		if (thing === -Infinity) return NEGATIVE_INFINITY;
+-		if (thing === 0 && 1 / thing < 0) return NEGATIVE_ZERO;
++		const type = ops.typeOf(thing);
++
++		if (type === 'undefined') return UNDEFINED;
++
++		/** @type {number | undefined} */
++		let number;
+ 
+-		if (indexes.has(thing)) return /** @type {number} */ (indexes.get(thing));
++		if (type === 'number') {
++			number = /** @type {number} */ (ops.primitive(thing));
++			if (Number.isNaN(number)) return NAN;
++			if (number === Infinity) return POSITIVE_INFINITY;
++			if (number === -Infinity) return NEGATIVE_INFINITY;
++			if (number === 0 && 1 / number < 0) return NEGATIVE_ZERO;
++		}
++
++		const id = ops.identify(thing);
++
++		if (indexes.has(id)) return /** @type {number} */ (indexes.get(id));
+ 
+ 		index ??= p++;
+-		indexes.set(thing, index);
++		indexes.set(id, index);
+ 
+ 		for (const { key, fn } of custom) {
+ 			const value = fn(thing);
+@@ -116,18 +136,19 @@ function run(async, value, reducers) {
+ 			}
+ 		}
+ 
+-		if (typeof thing === 'function') {
++		if (type === 'function') {
+ 			throw new DevalueError(`Cannot stringify a function`, keys, thing, value);
+-		} else if (typeof thing === 'symbol') {
++		} else if (type === 'symbol') {
+ 			throw new DevalueError(`Cannot stringify a Symbol primitive`, keys, thing, value);
+ 		}
+ 
+ 		/** @type {string | Promise<any>} */
+ 		let str = '';
+ 
+-		if (is_primitive(thing)) {
+-			str = stringify_primitive(thing);
+-		} else if (typeof thing.then === 'function') {
++		if (type !== 'object') {
++			// 'null' | 'boolean' | 'number' | 'bigint' | 'string'
++			str = stringify_primitive(type === 'number' ? number : ops.primitive(thing));
++		} else if (ops.isThenable(thing)) {
+ 			if (!async) {
+ 				throw new DevalueError(
+ 					`Cannot stringify a Promise or thenable — use stringifyAsync instead`,
+@@ -137,36 +158,35 @@ function run(async, value, reducers) {
+ 				);
+ 			}
+ 
+-			str = Promise.resolve(thing).then((value) => {
++			str = Promise.resolve(ops.resolveThenable(thing)).then((value) => {
+ 				const i = flatten(value, index);
+ 				if (i < 0) stringified[index] = i;
+ 			});
+ 		} else {
+-			const type = get_type(thing);
++			const tag = ops.tag(thing);
+ 
+-			switch (type) {
++			switch (tag) {
+ 				case 'Number':
+ 				case 'String':
+ 				case 'Boolean':
+ 				case 'BigInt':
+-					str = `["Object",${flatten(thing.valueOf())}]`;
++					str = `["Object",${flatten(ops.unbox(thing))}]`;
+ 					break;
+ 
+ 				case 'Date':
+-					const valid = !isNaN(thing.getDate());
+-					str = `["Date","${valid ? thing.toISOString() : ''}"]`;
++					str = `["Date","${ops.dateISO(thing)}"]`;
+ 					break;
+ 
+ 				case 'URL':
+-					str = `["URL",${stringify_string(thing.toString())}]`;
++					str = `["URL",${stringify_string(ops.toStringValue(thing))}]`;
+ 					break;
+ 
+ 				case 'URLSearchParams':
+-					str = `["URLSearchParams",${stringify_string(thing.toString())}]`;
++					str = `["URLSearchParams",${stringify_string(ops.toStringValue(thing))}]`;
+ 					break;
+ 
+ 				case 'RegExp':
+-					const { source, flags } = thing;
++					const { source, flags } = ops.regExp(thing);
+ 					str = flags
+ 						? `["RegExp",${stringify_string(source)},"${flags}"]`
+ 						: `["RegExp",${stringify_string(source)}]`;
+@@ -182,14 +202,16 @@ function run(async, value, reducers) {
+ 					// is what protects against the DoS of e.g. `arr[1000000] = 1`.
+ 					let mostly_dense = false;
+ 
++					const length = ops.arrayLength(thing);
++
+ 					str = '[';
+ 
+-					for (let i = 0; i < thing.length; i += 1) {
++					for (let i = 0; i < length; i += 1) {
+ 						if (i > 0) str += ',';
+ 
+-						if (Object.hasOwn(thing, i)) {
++						if (ops.hasOwnIndex(thing, i)) {
+ 							keys.push(`[${i}]`);
+-							str += flatten(thing[i]);
++							str += flatten(ops.get(thing, i));
+ 							keys.pop();
+ 						} else if (mostly_dense) {
+ 							// Use dense encoding. The heuristic guarantees the
+@@ -228,19 +250,19 @@ function run(async, value, reducers) {
+ 							//
+ 							// Sparse encoding is cheaper when:
+ 							//   (4 + d) + P * (d + 1) < (L - P) * 3
+-							const populated_keys = valid_array_indices(/** @type {any[]} */ (thing));
++							const populated_keys = ops.arrayIndices(thing);
+ 							const population = populated_keys.length;
+-							const d = String(thing.length).length;
++							const d = String(length).length;
+ 
+-							const hole_cost = (thing.length - population) * 3;
++							const hole_cost = (length - population) * 3;
+ 							const sparse_cost = 4 + d + population * (d + 1);
+ 
+ 							if (hole_cost > sparse_cost) {
+-								str = '[' + SPARSE + ',' + thing.length;
++								str = '[' + SPARSE + ',' + length;
+ 								for (let j = 0; j < populated_keys.length; j++) {
+ 									const key = populated_keys[j];
+ 									keys.push(`[${key}]`);
+-									str += ',' + key + ',' + flatten(thing[key]);
++									str += ',' + key + ',' + flatten(ops.get(thing, key));
+ 									keys.pop();
+ 								}
+ 								break;
+@@ -259,7 +281,7 @@ function run(async, value, reducers) {
+ 				case 'Set':
+ 					str = '["Set"';
+ 
+-					for (const value of thing) {
++					for (const value of ops.setValues(thing)) {
+ 						str += `,${flatten(value)}`;
+ 					}
+ 
+@@ -269,8 +291,13 @@ function run(async, value, reducers) {
+ 				case 'Map':
+ 					str = '["Map"';
+ 
+-					for (const [key, value] of thing) {
+-						keys.push(`.get(${is_primitive(key) ? stringify_primitive(key) : '...'})`);
++					for (const [key, value] of ops.mapEntries(thing)) {
++						const key_type = ops.typeOf(key);
++						const key_is_primitive =
++							key_type !== 'object' && key_type !== 'function' && key_type !== 'symbol';
++						keys.push(
++							`.get(${key_is_primitive ? stringify_primitive(ops.primitive(key)) : '...'})`
++						);
+ 						str += `,${flatten(key)},${flatten(value)}`;
+ 						keys.pop();
+ 					}
+@@ -291,14 +318,13 @@ function run(async, value, reducers) {
+ 				case 'BigInt64Array':
+ 				case 'BigUint64Array':
+ 				case 'DataView': {
+-					/** @type {import("./types.js").TypedArray} */
+-					const typedArray = thing;
+-					str = '["' + type + '",' + flatten(typedArray.buffer);
++					const info = ops.viewInfo(thing);
++					str = '["' + tag + '",' + flatten(info.buffer);
+ 
+ 					// handle subarrays
+-					if (typedArray.byteLength !== typedArray.buffer.byteLength) {
++					if (info.byteLength !== info.bufferByteLength) {
+ 						// to be used with `new TypedArray(buffer, byteOffset, length)`
+-						str += `,${typedArray.byteOffset},${typedArray.length}`;
++						str += `,${info.byteOffset},${info.length}`;
+ 					}
+ 
+ 					str += ']';
+@@ -306,9 +332,7 @@ function run(async, value, reducers) {
+ 				}
+ 
+ 				case 'ArrayBuffer': {
+-					/** @type {ArrayBuffer} */
+-					const arraybuffer = thing;
+-					const base64 = encode64(arraybuffer);
++					const base64 = encode64(ops.arrayBuffer(thing));
+ 
+ 					str = `["ArrayBuffer","${base64}"]`;
+ 					break;
+@@ -322,21 +346,23 @@ function run(async, value, reducers) {
+ 				case 'Temporal.PlainMonthDay':
+ 				case 'Temporal.PlainYearMonth':
+ 				case 'Temporal.ZonedDateTime':
+-					str = `["${type}",${stringify_string(thing.toString())}]`;
++					str = `["${tag}",${stringify_string(ops.toStringValue(thing))}]`;
+ 					break;
+ 
+-				default:
+-					if (!is_plain_object(thing)) {
++				default: {
++					const shape = ops.objectShape(thing);
++
++					if (shape.kind === 'not-plain') {
+ 						throw new DevalueError(`Cannot stringify arbitrary non-POJOs`, keys, thing, value);
+ 					}
+ 
+-					if (enumerable_symbols(thing).length > 0) {
++					if (shape.kind === 'symbol-keys') {
+ 						throw new DevalueError(`Cannot stringify POJOs with symbolic keys`, keys, thing, value);
+ 					}
+ 
+-					if (Object.getPrototypeOf(thing) === null) {
++					if (shape.kind === 'null-proto') {
+ 						str = '["null"';
+-						for (const key of Object.keys(thing)) {
++						for (const key of shape.keys) {
+ 							if (key === '__proto__') {
+ 								throw new DevalueError(
+ 									`Cannot stringify objects with __proto__ keys`,
+@@ -347,14 +373,14 @@ function run(async, value, reducers) {
+ 							}
+ 
+ 							keys.push(stringify_key(key));
+-							str += `,${stringify_string(key)},${flatten(thing[key])}`;
++							str += `,${stringify_string(key)},${flatten(ops.get(thing, key))}`;
+ 							keys.pop();
+ 						}
+ 						str += ']';
+ 					} else {
+ 						str = '{';
+ 						let started = false;
+-						for (const key of Object.keys(thing)) {
++						for (const key of shape.keys) {
+ 							if (key === '__proto__') {
+ 								throw new DevalueError(
+ 									`Cannot stringify objects with __proto__ keys`,
+@@ -367,11 +393,12 @@ function run(async, value, reducers) {
+ 							if (started) str += ',';
+ 							started = true;
+ 							keys.push(stringify_key(key));
+-							str += `${stringify_string(key)}:${flatten(thing[key])}`;
++							str += `${stringify_string(key)}:${flatten(ops.get(thing, key))}`;
+ 							keys.pop();
+ 						}
+ 						str += '}';
+ 					}
++				}
+ 			}
+ 		}
+ 
+diff --git a/src/types.d.ts b/src/types.d.ts
+index 5f1df8487a35ac493ca0d3221231b773417ca031..f7219ae27ab705fcbb83b8bc5eed8efe5729cc5d 100644
+--- a/src/types.d.ts
++++ b/src/types.d.ts
+@@ -11,3 +11,177 @@ export type TypedArray =
+ 	| Float64Array
+ 	| BigInt64Array
+ 	| BigUint64Array;
++
++/**
++ * The introspection/extraction operations `stringify` performs on the value
++ * being serialized. Every dynamic operation — property reads, prototype
++ * method calls, iteration, type classification — goes through this
++ * interface, so overriding members lets you control exactly how values are
++ * inspected.
++ *
++ * Use cases:
++ * - **Side-effect-free serialization**: replace operations that can execute
++ *   user code (getters, proxy traps, patched prototypes, `Symbol.toStringTag`
++ *   accessors) with implementations based on captured intrinsics, internal
++ *   slots, or property descriptors.
++ * - **Foreign-runtime serialization**: serialize values that live in another
++ *   JavaScript runtime (a `node:vm` context, a WASM-hosted engine, a remote
++ *   process) by implementing the operations over handle objects. The
++ *   `stringify` algorithm never touches the value directly, so "value" can
++ *   be any opaque token as long as the operations agree on what it means.
++ *
++ * All members are optional when passed to `stringify` — omitted members fall
++ * back to the defaults (native behavior, exported as `defaultOperations`).
++ */
++export interface StringifyOperations {
++	/**
++	 * Returns the key used for deduplication and cycle detection (compared
++	 * with `Map` key semantics). Two values that represent the same logical
++	 * object must return the same key. Default: the value itself.
++	 *
++	 * Override this when serializing through handles, where two distinct
++	 * handle objects may refer to the same underlying value.
++	 */
++	identify(value: any): unknown;
++
++	/**
++	 * Classifies a value. Same contract as the `typeof` operator, except
++	 * `null` must be reported as `'null'` (not `'object'`).
++	 */
++	typeOf(value: any):
++		| 'undefined'
++		| 'null'
++		| 'boolean'
++		| 'number'
++		| 'bigint'
++		| 'string'
++		| 'symbol'
++		| 'function'
++		| 'object';
++
++	/**
++	 * Extracts the host-JavaScript primitive from a value whose `typeOf` is
++	 * `'null'`, `'boolean'`, `'number'`, `'bigint'` or `'string'`.
++	 * Default: the value itself (it already is the primitive).
++	 */
++	primitive(value: any): undefined | null | boolean | number | bigint | string;
++
++	/**
++	 * Returns the brand of an object value — the strings produced by
++	 * `Object.prototype.toString` without the wrapping (`'Date'`, `'Array'`,
++	 * `'Map'`, `'Object'`, `'Temporal.Instant'`, …). This decides which
++	 * serialization strategy is used, so hardened implementations should use
++	 * engine-level brand checks rather than (spoofable, getter-invoking)
++	 * `Symbol.toStringTag` lookups.
++	 */
++	tag(value: any): string;
++
++	/** Returns true if the object value should be treated as a thenable. */
++	isThenable(value: any): boolean;
++
++	/**
++	 * Resolves a thenable to its settled value (which is then serialized).
++	 * Only called from `stringifyAsync` for values where `isThenable`
++	 * returned true.
++	 */
++	resolveThenable(value: any): Promise<any>;
++
++	/**
++	 * Extracts the inner value of a boxed primitive (`Number`, `String`,
++	 * `Boolean`, `BigInt` objects). Equivalent to `value.valueOf()`. The
++	 * result is serialized recursively, so it may be a foreign value/handle.
++	 */
++	unbox(value: any): any;
++
++	/**
++	 * Returns the ISO string for a `Date` value, or `''` for an invalid
++	 * date. Equivalent to `value.toISOString()`.
++	 */
++	dateISO(value: any): string;
++
++	/**
++	 * Returns the string form of a `URL`, `URLSearchParams` or `Temporal.*`
++	 * value. Equivalent to `value.toString()`.
++	 */
++	toStringValue(value: any): string;
++
++	/** Returns the source and flags of a `RegExp` value. */
++	regExp(value: any): { source: string; flags: string };
++
++	/**
++	 * Returns an iterable over the elements of a `Set` value. The iterable
++	 * is consumed on the host; elements may be foreign values/handles.
++	 */
++	setValues(value: any): Iterable<any>;
++
++	/**
++	 * Returns an iterable over the `[key, value]` entries of a `Map` value.
++	 * The iterable is consumed on the host; keys/values may be foreign
++	 * values/handles.
++	 */
++	mapEntries(value: any): Iterable<[any, any]>;
++
++	/**
++	 * Returns the view metadata of a typed array or `DataView` value.
++	 * `length` is only meaningful for typed arrays. `buffer` is serialized
++	 * recursively, so it may be a foreign value/handle.
++	 */
++	viewInfo(value: any): {
++		buffer: any;
++		byteOffset: number;
++		byteLength: number;
++		length?: number;
++		bufferByteLength: number;
++	};
++
++	/**
++	 * Returns a host `ArrayBuffer` with the bytes of an `ArrayBuffer` value.
++	 * Default: the value itself. Foreign-runtime implementations should copy
++	 * the bytes into a host buffer.
++	 */
++	arrayBuffer(value: any): ArrayBuffer;
++
++	/** Returns the length of an `Array` value. */
++	arrayLength(value: any): number;
++
++	/** Returns true if an `Array` value has an own element at `index`. */
++	hasOwnIndex(value: any, index: number): boolean;
++
++	/**
++	 * Returns the populated indices of a (sparse) `Array` value as strings,
++	 * in ascending order. Equivalent to `Object.keys(value)` filtered to
++	 * valid array indices.
++	 */
++	arrayIndices(value: any): string[];
++
++	/**
++	 * Classifies a plain-object candidate:
++	 * - `{ kind: 'plain' | 'null-proto', keys }` — a serializable POJO and
++	 *   its own enumerable string keys
++	 * - `{ kind: 'not-plain' }` — a non-POJO (stringify throws)
++	 * - `{ kind: 'symbol-keys' }` — a POJO with enumerable symbol keys
++	 *   (stringify throws)
++	 */
++	objectShape(
++		value: any
++	):
++		| { kind: 'plain' | 'null-proto'; keys: string[] }
++		| { kind: 'not-plain' }
++		| { kind: 'symbol-keys' };
++
++	/**
++	 * Reads a property from an `Array` or plain-object value. Equivalent to
++	 * `value[key]`. Hardened implementations can read through property
++	 * descriptors to control what happens for accessor properties.
++	 */
++	get(value: any, key: string | number): any;
++}
++
++/** Options for `stringify` and `stringifyAsync`. */
++export interface StringifyOptions {
++	/**
++	 * Overrides for the introspection/extraction operations used while
++	 * serializing. Omitted members fall back to `defaultOperations`.
++	 */
++	operations?: Partial<StringifyOperations>;
++}
