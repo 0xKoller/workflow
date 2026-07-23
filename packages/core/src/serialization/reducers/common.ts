@@ -4,6 +4,15 @@
  * Handles: ArrayBuffer, BigInt, typed arrays, Date, Error, Headers, Map, Set,
  * RegExp, Request, Response, URL, URLSearchParams.
  *
+ * Reducer predicates run on every value that crosses a serialization
+ * boundary, so they (and the payload extraction for the types they claim)
+ * are written to be passive: brand checks via `util.types` (cross-realm
+ * safe, immune to `Symbol.hasInstance` spoofing) and reads via captured
+ * intrinsics / `passiveGet` (see ../operations.ts). Where matching the old
+ * behavior requires running value-owned code (own getters, patched
+ * prototype members), the read taints the active passivity report instead
+ * of being skipped.
+ *
  * Note: Uses Node.js Buffer for base64 encoding/decoding. For environments
  * without Buffer (e.g. QuickJS VM), a polyfill or alternative base64
  * implementation will be needed.
@@ -16,7 +25,19 @@ import {
   RetryableError,
   RuntimeDecryptionError,
 } from '@workflow/errors';
+import {
+  capturedIntrinsics,
+  intrinsicHeadersEntries,
+  intrinsicMapEntries,
+  intrinsicSetValues,
+  isInstanceOfPrototype,
+  passiveErrorStackRead,
+  passiveGet,
+  taintSerialization,
+} from '../operations.js';
 import type { Reducers, Revivers, SerializableSpecial } from '../types.js';
+
+const bigIntToString = BigInt.prototype.toString;
 
 // ---- Base64 helpers ----
 
@@ -33,7 +54,11 @@ function arrayBufferToBase64(
 }
 
 function viewToBase64(value: ArrayBufferView): string {
-  return arrayBufferToBase64(value.buffer, value.byteOffset, value.byteLength);
+  return arrayBufferToBase64(
+    capturedIntrinsics.typedArrayBuffer.call(value) as ArrayBufferLike,
+    capturedIntrinsics.typedArrayByteOffset.call(value) as number,
+    capturedIntrinsics.typedArrayByteLength.call(value) as number
+  );
 }
 
 function reviveArrayBuffer(
@@ -94,13 +119,16 @@ type SimpleErrorSubclassKey = {
  * errors may originate from a different VM context, and `instanceof` fails
  * across VM boundaries since each context has its own Error constructor.
  */
-function reduceErrorBase(value: unknown): BaseErrorPayload | false {
+function reduceErrorBase(
+  value: unknown,
+  global: object
+): BaseErrorPayload | false {
   if (!types.isNativeError(value)) return false;
   const reduced: BaseErrorPayload = {
-    message: value.message,
-    stack: value.stack,
+    message: passiveGet(value, 'message') as string,
+    stack: passiveErrorStackRead(value, global) as string | undefined,
   };
-  if ('cause' in value) reduced.cause = (value as { cause: unknown }).cause;
+  if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
   return reduced;
 }
 
@@ -124,11 +152,12 @@ function reduceErrorBase(value: unknown): BaseErrorPayload | false {
  */
 function reduceNamedErrorSubclassBase(
   subclassName: string,
-  value: unknown
+  value: unknown,
+  global: object
 ): BaseErrorPayload | false {
   if (!types.isNativeError(value)) return false;
-  if (value.name !== subclassName) return false;
-  return reduceErrorBase(value);
+  if (passiveGet(value, 'name') !== subclassName) return false;
+  return reduceErrorBase(value, global);
 }
 
 /**
@@ -138,10 +167,11 @@ function reduceNamedErrorSubclassBase(
  * fail across VM boundaries.
  */
 function makeErrorSubclassReducer<K extends SimpleErrorSubclassKey>(
-  subclassName: K
+  subclassName: K,
+  global: object
 ) {
   return (value: unknown): SerializableSpecial[K] | false => {
-    const base = reduceNamedErrorSubclassBase(subclassName, value);
+    const base = reduceNamedErrorSubclassBase(subclassName, value, global);
     if (!base) return false;
     return base as SerializableSpecial[K];
   };
@@ -174,17 +204,25 @@ export function getCommonReducers(
 ): Partial<Reducers> {
   return {
     ArrayBuffer: (value) =>
-      value instanceof global.ArrayBuffer &&
-      arrayBufferToBase64(value, 0, value.byteLength),
-    BigInt: (value) => typeof value === 'bigint' && value.toString(),
+      types.isArrayBuffer(value) &&
+      arrayBufferToBase64(
+        value,
+        0,
+        capturedIntrinsics.arrayBufferByteLength.call(value) as number
+      ),
+    BigInt: (value) => typeof value === 'bigint' && bigIntToString.call(value),
     BigInt64Array: (value) =>
-      value instanceof global.BigInt64Array && viewToBase64(value),
+      types.isBigInt64Array(value) && viewToBase64(value),
     BigUint64Array: (value) =>
-      value instanceof global.BigUint64Array && viewToBase64(value),
+      types.isBigUint64Array(value) && viewToBase64(value),
     Date: (value) => {
-      if (!(value instanceof global.Date)) return false;
-      const valid = !Number.isNaN(value.getDate());
-      return valid ? value.toISOString() : '.';
+      if (!types.isDate(value)) return false;
+      const valid = !Number.isNaN(
+        capturedIntrinsics.dateGetDate.call(value) as number
+      );
+      return valid
+        ? (capturedIntrinsics.dateToISOString.call(value) as string)
+        : '.';
     },
     // DOMException is a special case: it `instanceof Error` is true in Node,
     // but `types.isNativeError()` returns FALSE for it, so the generic Error
@@ -194,18 +232,30 @@ export function getCommonReducers(
     // for instances minted in another context).
     DOMException: (value) => {
       if (value === null || typeof value !== 'object') return false;
+      const ctor = passiveGet(value, 'constructor');
       if (
-        (value as { constructor?: { name?: string } }).constructor?.name !==
-        'DOMException'
-      )
+        (ctor === null || typeof ctor !== 'object') &&
+        typeof ctor !== 'function'
+      ) {
         return false;
-      const e = value as Error & { cause?: unknown };
+      }
+      if (passiveGet(ctor as object, 'name') !== 'DOMException') return false;
+      // message/name live as getters on DOMException.prototype; the captured
+      // host getters are allowed since the VM shares the host class.
       const reduced: SerializableSpecial['DOMException'] = {
-        message: e.message,
-        name: e.name,
-        stack: e.stack,
+        message: passiveGet(
+          value,
+          'message',
+          capturedIntrinsics.domExceptionMessage
+        ) as string,
+        name: passiveGet(
+          value,
+          'name',
+          capturedIntrinsics.domExceptionName
+        ) as string,
+        stack: passiveErrorStackRead(value, global) as string | undefined,
       };
-      if ('cause' in e) reduced.cause = e.cause;
+      if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
       return reduced;
     },
     // Error subclass reducers are intentionally placed before the base Error
@@ -213,37 +263,48 @@ export function getCommonReducers(
     // must be checked first so that e.g. a TypeError is serialized as "TypeError"
     // rather than falling through to the generic "Error" reducer.
     // See `makeErrorSubclassReducer` for implementation details.
-    EvalError: makeErrorSubclassReducer('EvalError'),
-    FatalError: makeErrorSubclassReducer('FatalError'),
+    EvalError: makeErrorSubclassReducer('EvalError', global),
+    FatalError: makeErrorSubclassReducer('FatalError', global),
     HookConflictError: (value) => {
-      const base = reduceNamedErrorSubclassBase('HookConflictError', value);
+      const base = reduceNamedErrorSubclassBase(
+        'HookConflictError',
+        value,
+        global
+      );
       if (!base) return false;
-      const error = value as HookConflictError;
       const reduced: SerializableSpecial['HookConflictError'] = {
         ...base,
-        token: error.token,
+        token: passiveGet(value as object, 'token') as string,
       };
-      if (error.conflictingRunId !== undefined) {
-        reduced.conflictingRunId = error.conflictingRunId;
+      const conflictingRunId = passiveGet(value as object, 'conflictingRunId');
+      if (conflictingRunId !== undefined) {
+        reduced.conflictingRunId = conflictingRunId as string;
       }
       return reduced;
     },
-    RangeError: makeErrorSubclassReducer('RangeError'),
-    ReferenceError: makeErrorSubclassReducer('ReferenceError'),
+    RangeError: makeErrorSubclassReducer('RangeError', global),
+    ReferenceError: makeErrorSubclassReducer('ReferenceError', global),
     // RetryableError carries an extra `retryAfter` Date that we serialize as
-    // a numeric epoch timestamp. The Date reducer uses `instanceof global.Date`,
-    // which fails for Dates from a different VM realm; serializing as a
-    // number sidesteps that issue.
+    // a numeric epoch timestamp (kept for wire-format compatibility).
     RetryableError: (value) => {
-      const base = reduceNamedErrorSubclassBase('RetryableError', value);
+      const base = reduceNamedErrorSubclassBase(
+        'RetryableError',
+        value,
+        global
+      );
       if (!base) return false;
-      const retryAfterRaw = (value as RetryableError).retryAfter as unknown;
+      const retryAfterRaw = passiveGet(value as object, 'retryAfter');
       let retryAfter: number;
-      if (
+      if (types.isDate(retryAfterRaw)) {
+        const t = capturedIntrinsics.dateGetTime.call(retryAfterRaw) as number;
+        retryAfter = Number.isNaN(t) ? Date.now() + 1000 : t;
+      } else if (
         retryAfterRaw &&
         typeof retryAfterRaw === 'object' &&
-        typeof (retryAfterRaw as { getTime?: unknown }).getTime === 'function'
+        typeof passiveGet(retryAfterRaw, 'getTime') === 'function'
       ) {
+        // A Date-like object with its own getTime — value-owned code.
+        taintSerialization('RetryableError.retryAfter getTime()');
         const t = (retryAfterRaw as Date).getTime();
         retryAfter = Number.isNaN(t) ? Date.now() + 1000 : t;
       } else if (
@@ -266,29 +327,36 @@ export function getCommonReducers(
     RuntimeDecryptionError: (value) => {
       const base = reduceNamedErrorSubclassBase(
         'RuntimeDecryptionError',
-        value
+        value,
+        global
       );
       if (!base) return false;
       const reduced: SerializableSpecial['RuntimeDecryptionError'] = {
         ...base,
       };
-      const context = (value as RuntimeDecryptionError).context;
+      const context = passiveGet(value as object, 'context') as
+        | RuntimeDecryptionError['context']
+        | undefined;
       if (context !== undefined) {
         reduced.context = context;
       }
       return reduced;
     },
-    SyntaxError: makeErrorSubclassReducer('SyntaxError'),
-    TypeError: makeErrorSubclassReducer('TypeError'),
-    URIError: makeErrorSubclassReducer('URIError'),
+    SyntaxError: makeErrorSubclassReducer('SyntaxError', global),
+    TypeError: makeErrorSubclassReducer('TypeError', global),
+    URIError: makeErrorSubclassReducer('URIError', global),
     // AggregateError is similar to other subclasses but also preserves the
     // `errors` array. We extend the base helper's output here.
     AggregateError: (value) => {
-      const base = reduceNamedErrorSubclassBase('AggregateError', value);
+      const base = reduceNamedErrorSubclassBase(
+        'AggregateError',
+        value,
+        global
+      );
       if (!base) return false;
       return {
         ...base,
-        errors: (value as AggregateError).errors,
+        errors: passiveGet(value as object, 'errors') as unknown[],
       } satisfies SerializableSpecial['AggregateError'];
     },
     // Base Error reducer — catch-all for any Error instance not matched by a
@@ -298,59 +366,83 @@ export function getCommonReducers(
     Error: (value) => {
       if (!types.isNativeError(value)) return false;
       const reduced: SerializableSpecial['Error'] = {
-        name: value.name,
-        message: value.message,
-        stack: value.stack,
+        name: passiveGet(value, 'name') as string,
+        message: passiveGet(value, 'message') as string,
+        stack: passiveErrorStackRead(value, global) as string | undefined,
       };
-      if ('cause' in value) reduced.cause = value.cause;
+      if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
       return reduced;
     },
-    Float32Array: (value) =>
-      value instanceof global.Float32Array && viewToBase64(value),
-    Float64Array: (value) =>
-      value instanceof global.Float64Array && viewToBase64(value),
-    Headers: (value) => value instanceof global.Headers && Array.from(value),
-    Int8Array: (value) =>
-      value instanceof global.Int8Array && viewToBase64(value),
-    Int16Array: (value) =>
-      value instanceof global.Int16Array && viewToBase64(value),
-    Int32Array: (value) =>
-      value instanceof global.Int32Array && viewToBase64(value),
-    Map: (value) => value instanceof global.Map && Array.from(value),
+    Float32Array: (value) => types.isFloat32Array(value) && viewToBase64(value),
+    Float64Array: (value) => types.isFloat64Array(value) && viewToBase64(value),
+    // Headers/URL/URLSearchParams are host classes shared into the workflow
+    // VM by reference (see vm/index.ts), so a prototype-chain check against
+    // the host class brands instances from either realm, and the captured
+    // host members read them without dispatching patchable prototypes.
+    Headers: (value) =>
+      isInstanceOfPrototype(value, Headers.prototype) &&
+      intrinsicHeadersEntries(value as Headers),
+    Int8Array: (value) => types.isInt8Array(value) && viewToBase64(value),
+    Int16Array: (value) => types.isInt16Array(value) && viewToBase64(value),
+    Int32Array: (value) => types.isInt32Array(value) && viewToBase64(value),
+    Map: (value) =>
+      types.isMap(value) && intrinsicMapEntries(value as Map<unknown, unknown>),
     RegExp: (value) =>
-      value instanceof global.RegExp && {
-        source: value.source,
-        flags: value.flags,
+      types.isRegExp(value) && {
+        source: capturedIntrinsics.regExpSource.call(value) as string,
+        flags: capturedIntrinsics.regExpFlags.call(value) as string,
       },
     // Request and Response are intentionally NOT in common reducers.
     // They require mode-specific revivers (stream handling, etc.) and
     // including them here without matching revivers would cause them
     // to deserialize as plain objects.
-    Set: (value) => value instanceof global.Set && Array.from(value),
-    URL: (value) => value instanceof global.URL && value.href,
+    Set: (value) =>
+      types.isSet(value) && intrinsicSetValues(value as Set<unknown>),
+    URL: (value) =>
+      isInstanceOfPrototype(value, URL.prototype) &&
+      (passiveGet(
+        value as object,
+        'href',
+        capturedIntrinsics.urlHref
+      ) as string),
     WorkflowFunction: (value) => {
       // Only match function references with a workflowId property (set by
       // the SWC compiler on workflow functions). Plain { workflowId } objects
       // are NOT matched — this prevents infinite recursion since the reduced
       // form { workflowId } is a plain object, not a function.
       if (typeof value !== 'function') return false;
-      const workflowId = (value as any).workflowId;
+      const workflowId = passiveGet(value, 'workflowId');
       if (typeof workflowId !== 'string') return false;
       return { workflowId };
     },
     URLSearchParams: (value) => {
-      if (!(value instanceof global.URLSearchParams)) return false;
-      if (value.size === 0) return '.';
+      if (!isInstanceOfPrototype(value, URLSearchParams.prototype)) {
+        return false;
+      }
+      const size = passiveGet(
+        value as object,
+        'size',
+        capturedIntrinsics.urlSearchParamsSize
+      ) as number;
+      if (size === 0) return '.';
+      // `String(value)` dispatches Symbol.toPrimitive/toString; use the
+      // captured toString when the value resolves to the pristine one, and
+      // taint + preserve the dynamic behavior otherwise.
+      if (
+        passiveGet(value as object, Symbol.toPrimitive) === undefined &&
+        passiveGet(value as object, 'toString') ===
+          capturedIntrinsics.urlSearchParamsToString
+      ) {
+        return capturedIntrinsics.urlSearchParamsToString.call(value);
+      }
+      taintSerialization('URLSearchParams toString dispatch');
       return String(value);
     },
-    Uint8Array: (value) =>
-      value instanceof global.Uint8Array && viewToBase64(value),
+    Uint8Array: (value) => types.isUint8Array(value) && viewToBase64(value),
     Uint8ClampedArray: (value) =>
-      value instanceof global.Uint8ClampedArray && viewToBase64(value),
-    Uint16Array: (value) =>
-      value instanceof global.Uint16Array && viewToBase64(value),
-    Uint32Array: (value) =>
-      value instanceof global.Uint32Array && viewToBase64(value),
+      types.isUint8ClampedArray(value) && viewToBase64(value),
+    Uint16Array: (value) => types.isUint16Array(value) && viewToBase64(value),
+    Uint32Array: (value) => types.isUint32Array(value) && viewToBase64(value),
   };
 }
 

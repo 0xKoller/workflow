@@ -100,8 +100,8 @@ const mixedBatchWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP"
   }
   globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
 
-// Map/Date/typed-array arguments serialize through pinned prototype members
-// (see runtime/retained-step-input.ts), so these boundaries stay retainable.
+// Map/Date/typed-array arguments serialize through captured host intrinsics
+// (see serialization/operations.ts), so these boundaries stay retainable.
 const builtinArgsWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
   const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
   async function workflow() {
@@ -126,9 +126,10 @@ const polyfillArgsWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STE
   }
   globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
 
-// Replacing a member serialization executes (Date reducer calls getDate /
-// toISOString — serialization/reducers/common.ts:184-188) declines retention
-// for boundaries passing that type; converting to a string first retains.
+// Replacing a serialization-relevant member (Date.prototype.toISOString)
+// does not affect retention: the Date reducer reads through captured host
+// intrinsics (see serialization/operations.ts), so the patched member never
+// executes and the serialized bytes stay pristine in both modes.
 const patchedDateArgWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
   const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
   Date.prototype.toISOString = function () { return "patched"; };
@@ -386,13 +387,13 @@ describe('retained VM through the inline replay loop', () => {
     expect(vmBuilds).toBe(1);
   });
 
-  it('demotes a Date arg when an executed serialization member is replaced', async () => {
+  it('retains a Date arg even when a serialization member is replaced', async () => {
     const { vmBuilds, output } = await drive(
       'wrun_retained_patched_date',
       patchedDateArgWorkflow
     );
     expect(output).toBeInstanceOf(Uint8Array);
-    expect(vmBuilds).toBeGreaterThan(1);
+    expect(vmBuilds).toBe(1);
   });
 
   it('retains when the patched type is converted to a string first', async () => {

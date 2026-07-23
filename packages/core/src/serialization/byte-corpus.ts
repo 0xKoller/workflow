@@ -11,8 +11,8 @@
  * the wire format". See byte-stability.test.ts for how.
  */
 
-import { WORKFLOW_SERIALIZE } from '@workflow/serde';
 import { FatalError, RetryableError } from '@workflow/errors';
+import { WORKFLOW_SERIALIZE } from '@workflow/serde';
 
 /** An error with a deterministic stack, safe to pin in a snapshot. */
 function fixedError<T extends Error>(error: T, stack: string): T {

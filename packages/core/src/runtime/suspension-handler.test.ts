@@ -397,3 +397,95 @@ describe('handleSuspension', () => {
     ).toBe(false);
   });
 });
+
+describe('retainedStepInputsSafe (serialization passivity gate)', () => {
+  function stepPending(args: unknown[]) {
+    return new Map([
+      [
+        'step_1',
+        {
+          type: 'step' as const,
+          correlationId: 'step_1',
+          stepName: 'someStep',
+          args,
+        },
+      ],
+    ]);
+  }
+
+  async function runSuspension(
+    args: unknown[],
+    { prepareForRetention = true } = {}
+  ) {
+    const eventsCreate = vi
+      .fn()
+      .mockImplementation(async (_runId, event) => ({ event }));
+    const world = createWorld(eventsCreate);
+    return handleSuspension({
+      suspension: new WorkflowSuspension(stepPending(args), globalThis),
+      world,
+      run,
+      prepareForRetention,
+    });
+  }
+
+  it('reports safe for plain data and supported built-ins', async () => {
+    const result = await runSuspension([
+      { nested: [{ ok: true }, 'text', 42n], flag: false },
+      new Map([['k', new Set([1])]]),
+      new Date(1700000000000),
+      new Uint8Array([1, 2, 3]),
+      /pattern/gi,
+      new URL('https://example.com/'),
+      new Error('recorded failure'),
+    ]);
+    expect(result.retainedStepInputsSafe).toBe(true);
+  });
+
+  it('reports unsafe when serializing an argument executes a getter', async () => {
+    const value: Record<string, unknown> = {};
+    Object.defineProperty(value, 'lazy', {
+      enumerable: true,
+      get: () => 'computed',
+    });
+    const result = await runSuspension([{ deep: [value] }]);
+    expect(result.retainedStepInputsSafe).toBe(false);
+  });
+
+  it('reports unsafe when an argument is a proxy', async () => {
+    const result = await runSuspension([new Proxy({ a: 1 }, {})]);
+    expect(result.retainedStepInputsSafe).toBe(false);
+  });
+
+  it('still serializes tainted inputs successfully (bytes are unaffected)', async () => {
+    const value: Record<string, unknown> = {};
+    Object.defineProperty(value, 'lazy', {
+      enumerable: true,
+      get: () => 'computed',
+    });
+    const eventsCreate = vi
+      .fn()
+      .mockImplementation(async (_runId, event) => ({ event }));
+    const world = createWorld(eventsCreate);
+    const result = await handleSuspension({
+      suspension: new WorkflowSuspension(stepPending([value]), globalThis),
+      world,
+      run,
+      prepareForRetention: true,
+    });
+    expect(result.retainedStepInputsSafe).toBe(false);
+    // The step is still prepared for execution as usual.
+    expect(
+      result.lazyInlineSteps.length + result.createdStepCorrelationIds.size
+    ).toBeGreaterThan(0);
+  });
+
+  it('always reports safe when not preparing for retention', async () => {
+    const value: Record<string, unknown> = {};
+    Object.defineProperty(value, 'lazy', { enumerable: true, get: () => 1 });
+    const result = await runSuspension([value], {
+      prepareForRetention: false,
+    });
+    expect(result.retainedStepInputsSafe).toBe(true);
+  });
+});

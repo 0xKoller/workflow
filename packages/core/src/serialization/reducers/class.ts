@@ -8,6 +8,7 @@
 
 import { WORKFLOW_DESERIALIZE, WORKFLOW_SERIALIZE } from '@workflow/serde';
 import { getSerializationClass } from '../../class-serialization.js';
+import { passiveGet, taintSerialization } from '../operations.js';
 import type { Reducers, Revivers } from '../types.js';
 
 // ---- Reducers ----
@@ -19,25 +20,27 @@ export function getClassReducers(): Partial<Reducers> {
     // over the generic Error serialization (devalue uses first-match-wins).
     Class: (value) => {
       if (typeof value !== 'function') return false;
-      const classId = (value as any).classId;
+      const classId = passiveGet(value, 'classId');
       if (typeof classId !== 'string') return false;
       return { classId };
     },
     Instance: (value) => {
       if (value === null || typeof value !== 'object') return false;
-      const cls = value.constructor;
+      const cls = passiveGet(value, 'constructor');
       if (!cls || typeof cls !== 'function') return false;
 
-      const serialize = cls[WORKFLOW_SERIALIZE];
+      const serialize = passiveGet(cls, WORKFLOW_SERIALIZE);
       if (typeof serialize !== 'function') return false;
 
-      const classId = cls.classId;
+      const classId = passiveGet(cls, 'classId');
       if (typeof classId !== 'string') {
         throw new Error(
-          `Class "${cls.name}" with ${String(WORKFLOW_SERIALIZE)} must have a static "classId" property.`
+          `Class "${passiveGet(cls, 'name')}" with ${String(WORKFLOW_SERIALIZE)} must have a static "classId" property.`
         );
       }
 
+      // The custom serializer is user code by definition.
+      taintSerialization(`WORKFLOW_SERIALIZE for class "${classId}"`);
       const data = serialize.call(cls, value);
       return { classId, data };
     },

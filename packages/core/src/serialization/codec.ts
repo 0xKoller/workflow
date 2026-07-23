@@ -15,6 +15,7 @@
  */
 
 import type { CompressionStats } from './compression.js';
+import type { SerializationPassivityReport } from './operations.js';
 import type { FormatPrefix } from './types.js';
 
 /**
@@ -72,6 +73,16 @@ export interface CodecOptions {
    * Used by the dehydrate/hydrate wrappers to emit OTel span attributes.
    */
   compressionStats?: CompressionStats;
+
+  /**
+   * Optional sink recording whether serializing the value executed code
+   * the value's owner controls (getters, proxy traps, custom serializers).
+   * Consulted by the retained-VM suspension path — a tainted serialization
+   * means the retained VM may have diverged from what a cold replay would
+   * compute, so the session must fall back to ordinary replay. See
+   * ./operations.ts.
+   */
+  passivityReport?: SerializationPassivityReport;
 }
 
 export interface Codec {

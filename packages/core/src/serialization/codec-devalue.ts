@@ -10,8 +10,9 @@
  * typed arrays, Map, Set natively).
  */
 
-import { parse, stringify, unflatten } from 'devalue';
+import { parse, unflatten } from 'devalue';
 import type { Codec, CodecOptions, SerializationMode } from './codec.js';
+import { hardenedStringify } from './operations.js';
 import { getClassReducers, getClassRevivers } from './reducers/class.js';
 import { getCommonReducers, getCommonRevivers } from './reducers/common.js';
 import {
@@ -112,7 +113,7 @@ export const devalueCodec: Codec = {
       options?.global,
       options?.extraReducers
     );
-    const str = stringify(value, reducers);
+    const str = hardenedStringify(value, reducers, options?.passivityReport);
     return encoder.encode(str);
   },
 

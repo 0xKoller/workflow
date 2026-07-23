@@ -1,5 +1,4 @@
 import type { Span } from '@opentelemetry/api';
-import { isRetainedSerializationPassive } from './retained-step-input.js';
 import {
   EntityConflictError,
   FatalError,
@@ -27,6 +26,7 @@ import type {
   WorkflowSuspension,
 } from '../global.js';
 import { runtimeLogger } from '../logger.js';
+import type { SerializationPassivityReport } from '../serialization/operations.js';
 import { dehydrateStepArguments } from '../serialization.js';
 import * as Attribute from '../telemetry/semantic-conventions.js';
 import { getAbortStreamIdFromToken } from '../util.js';
@@ -58,8 +58,9 @@ export interface SuspensionHandlerParams {
    */
   runReadyBarrier?: Promise<unknown>;
   /**
-   * Prepare new step inputs without traversing workflow-owned objects during
-   * serialization. Enabled only while the caller is holding a retained VM.
+   * Record whether serializing new step inputs executed workflow code (see
+   * `retainedStepInputsSafe`). Enabled only while the caller is holding a
+   * retained VM.
    */
   prepareForRetention?: boolean;
 }
@@ -127,7 +128,13 @@ export interface SuspensionHandlerResult {
    * durably creating the user's hooks doesn't count as runtime overhead.
    */
   hookCreationMs: number;
-  /** Whether every newly serialized step input was passive retained-VM data. */
+  /**
+   * Whether serializing this suspension's new step inputs was passive (did
+   * not execute workflow-owned code such as getters, proxy traps, or custom
+   * serializers). `false` means the retained VM may have diverged from what
+   * a cold replay would compute, so the caller must demote to replay.
+   * Always `true` when `prepareForRetention` was not set.
+   */
   retainedStepInputsSafe: boolean;
 }
 
@@ -500,30 +507,16 @@ export async function handleSuspension({
 
   // Serialization always runs through the one ordinary path below, so the
   // durable bytes cannot depend on retention. What retention needs to know is
-  // whether that serialization will execute workflow code (getters, hooks,
-  // patched prototype members) — side effects a cold replay would not repeat.
-  // If any input in the batch is not provably passive, the caller demotes
-  // the session so the side effects land in a VM that is about to be
-  // discarded, exactly like the pre-retention runtime.
-  let retainedStepInputsSafe = true;
-  if (prepareForRetention) {
-    for (const queueItem of stepItems) {
-      if (!stepsNeedingCreation.has(queueItem.correlationId)) continue;
-      if (
-        !isRetainedSerializationPassive(
-          {
-            args: queueItem.args,
-            closureVars: queueItem.closureVars,
-            thisVal: queueItem.thisVal,
-          },
-          suspension.globalThis
-        )
-      ) {
-        retainedStepInputsSafe = false;
-        break;
-      }
-    }
-  }
+  // whether that serialization *executed* workflow code (getters, proxy
+  // traps, custom serializers) — side effects a cold replay would not
+  // repeat, since a replay skips dehydration for already-recorded steps.
+  // The hardened stringify operations record exactly that into this report
+  // (see ../serialization/operations.ts); when any input in the batch
+  // taints it, the caller demotes the session so the side effects land in a
+  // VM that is about to be discarded, exactly like the pre-retention
+  // runtime.
+  const passivityReport: SerializationPassivityReport | undefined =
+    prepareForRetention ? { tainted: false, reasons: [] } : undefined;
 
   // Lazy inline start: defer the step_created write for up to
   // `getMaxInlineSteps()` steps the caller will run inline (in parallel). Each
@@ -568,7 +561,8 @@ export async function handleSuspension({
             encryptionKey,
             suspension.globalThis,
             false,
-            compression
+            compression,
+            passivityReport
           );
           // Deferred (lazy) inline step: skip the step_created write — the
           // caller's inline executeStep will send a lazy step_started carrying
@@ -709,6 +703,15 @@ export async function handleSuspension({
   // message is not acked and VQS redelivers, re-creates the (idempotent)
   // step_created and re-dispatches, and recovers the run instead of orphaning it.
   await Promise.all(ops);
+
+  // The step-input dehydrations above have settled, so the report is final.
+  const retainedStepInputsSafe = !passivityReport?.tainted;
+  if (passivityReport?.tainted) {
+    runtimeLogger.debug(
+      'Serializing step inputs executed workflow code; falling back to replay instead of retaining the VM',
+      { workflowRunId: runId, reasons: passivityReport.reasons }
+    );
+  }
 
   // Rebuild the inline batch in deterministic order. `lazyInlineCorrelationIds`
   // is a Set seeded from the ordered first-N slice, so iterating it preserves

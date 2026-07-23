@@ -4,7 +4,7 @@ import {
   WorkflowRuntimeError,
 } from '@workflow/errors';
 import { envNumber } from '@workflow/world';
-import { parse, stringify, unflatten } from 'devalue';
+import { parse, unflatten } from 'devalue';
 import { monotonicFactory } from 'ulid';
 import {
   decrypt as aesGcmDecrypt,
@@ -48,6 +48,15 @@ import {
   isEncrypted,
   peekFormatPrefix,
 } from './serialization/format.js';
+// All devalue stringify calls go through the hardened wrapper so the
+// side-effect-free operations (and passivity tainting) apply uniformly —
+// see ./serialization/operations.ts.
+import {
+  isInstanceOfPrototype,
+  passiveGet,
+  type SerializationPassivityReport,
+  hardenedStringify as stringify,
+} from './serialization/operations.js';
 import {
   getClassReducers,
   getClassRevivers,
@@ -1286,9 +1295,31 @@ import type {
  * Base reducers shared across all serialization boundaries.
  * Composes: class + step-function + common reducers from the modular modules.
  */
+/**
+ * Passively resolve `global[name].prototype` for prototype-chain brand
+ * checks (see `isInstanceOfPrototype`). Returns undefined when the binding
+ * is missing or not a function (e.g. the workflow VM's `AbortSignal`, which
+ * is a plain object) — matching how the old `instanceof` predicates guarded
+ * on `typeof global[name] === 'function'`.
+ */
+function resolvePrototype(
+  global: Record<string, any>,
+  name: string
+): object | undefined {
+  const ctor = passiveGet(global, name);
+  if (typeof ctor !== 'function') return undefined;
+  return passiveGet(ctor, 'prototype') as object | undefined;
+}
+
 function getAllBaseReducers(
   global: Record<string, any> = globalThis
 ): Partial<Reducers> {
+  // Resolve the realm's constructors once per reducer set. In the workflow
+  // VM these are custom classes installed by workflow.ts (not host classes),
+  // so brand checks must go through the passed `global`.
+  const RequestPrototype = resolvePrototype(global, 'Request');
+  const ResponsePrototype = resolvePrototype(global, 'Response');
+
   // Class/Instance MUST come before Error so that custom Error subclasses
   // with WORKFLOW_SERIALIZE take precedence (devalue uses first-match-wins).
   return {
@@ -1298,17 +1329,20 @@ function getAllBaseReducers(
     // Request and Response reducers are mode-specific and added by
     // getExternalReducers / getWorkflowReducers / getStepReducers below.
     Request: (value) => {
-      if (!(value instanceof global.Request)) return false;
+      if (!isInstanceOfPrototype(value, RequestPrototype)) return false;
       const data: SerializableSpecial['Request'] = {
-        method: value.method,
-        url: value.url,
-        headers: value.headers,
-        body: value.body,
-        duplex: value.duplex,
+        method: passiveGet(value, 'method') as string,
+        url: passiveGet(value, 'url') as string,
+        headers: passiveGet(value, 'headers') as Headers,
+        body: passiveGet(value, 'body') as ReadableStream | null,
+        duplex: passiveGet(
+          value,
+          'duplex'
+        ) as SerializableSpecial['Request']['duplex'],
       };
-      const responseWritable = value[WEBHOOK_RESPONSE_WRITABLE];
+      const responseWritable = passiveGet(value, WEBHOOK_RESPONSE_WRITABLE);
       if (responseWritable) {
-        data.responseWritable = responseWritable;
+        data.responseWritable = responseWritable as WritableStream;
       }
       // Forward the signal in two cases:
       //   1. Already aborted — preserve aborted=true/reason so the hydrated
@@ -1319,25 +1353,30 @@ function getAllBaseReducers(
       // Plain non-aborted native signals are intentionally dropped (would
       // mint stream infra for every Request, including the auto-generated
       // signal on `new Request(url)`).
+      const signal = passiveGet(value, 'signal') as
+        | (AbortSignal & AbortInternals)
+        | undefined;
       if (
-        value.signal &&
-        (value.signal.aborted ||
-          (value.signal as AbortInternals)[ABORT_STREAM_NAME])
+        signal &&
+        (passiveGet(signal, 'aborted') || passiveGet(signal, ABORT_STREAM_NAME))
       ) {
-        data.signal = value.signal;
+        data.signal = signal;
       }
       return data;
     },
     Response: (value) => {
-      if (!(value instanceof global.Response)) return false;
+      if (!isInstanceOfPrototype(value, ResponsePrototype)) return false;
       return {
-        type: value.type,
-        url: value.url,
-        status: value.status,
-        statusText: value.statusText,
-        headers: value.headers,
-        body: value.body,
-        redirected: value.redirected,
+        type: passiveGet(
+          value,
+          'type'
+        ) as SerializableSpecial['Response']['type'],
+        url: passiveGet(value, 'url') as string,
+        status: passiveGet(value, 'status') as number,
+        statusText: passiveGet(value, 'statusText') as string,
+        headers: passiveGet(value, 'headers') as Headers,
+        body: passiveGet(value, 'body') as ReadableStream | null,
+        redirected: passiveGet(value, 'redirected') as boolean,
       };
     },
   };
@@ -1664,37 +1703,45 @@ export function getExternalReducers(
 export function getWorkflowReducers(
   global: Record<string, any> = globalThis
 ): Partial<Reducers> {
+  // In the workflow VM these are custom classes installed by workflow.ts,
+  // so resolve their prototypes from the passed `global` (passively, once).
+  const readableStreamPrototype = resolvePrototype(global, 'ReadableStream');
+  const writableStreamPrototype = resolvePrototype(global, 'WritableStream');
+  const abortControllerPrototype = resolvePrototype(global, 'AbortController');
+  const abortSignalPrototype = resolvePrototype(global, 'AbortSignal');
+
   return {
     ...getAllBaseReducers(global),
 
     // Readable/Writable streams from within the workflow execution environment
     // are simply "handles" that can be passed around to other steps.
     ReadableStream: (value) => {
-      if (!(value instanceof global.ReadableStream)) return false;
+      if (!isInstanceOfPrototype(value, readableStreamPrototype)) return false;
 
       // Check if this is a fake stream storing BodyInit from Request/Response constructor
-      const bodyInit = value[BODY_INIT_SYMBOL];
+      const bodyInit = passiveGet(value, BODY_INIT_SYMBOL);
       if (bodyInit !== undefined) {
         // This is a fake stream - serialize the BodyInit directly
         // devalue will handle serializing strings, Uint8Array, etc.
         return { bodyInit };
       }
 
-      const name = value[STREAM_NAME_SYMBOL];
+      const name = passiveGet(value, STREAM_NAME_SYMBOL) as string | undefined;
       if (!name) {
         throw new WorkflowRuntimeError('ReadableStream `name` is not set');
       }
       const s: SerializableSpecial['ReadableStream'] = { name };
-      const type = value[STREAM_TYPE_SYMBOL];
+      const type = passiveGet(value, STREAM_TYPE_SYMBOL) as 'bytes' | undefined;
       if (type) s.type = type;
-      const framing: ByteStreamFraming | undefined =
-        value[STREAM_FRAMING_SYMBOL];
+      const framing = passiveGet(value, STREAM_FRAMING_SYMBOL) as
+        | ByteStreamFraming
+        | undefined;
       if (framing) s.framing = framing;
       return s;
     },
     WritableStream: (value) => {
-      if (!(value instanceof global.WritableStream)) return false;
-      const name = value[STREAM_NAME_SYMBOL];
+      if (!isInstanceOfPrototype(value, writableStreamPrototype)) return false;
+      const name = passiveGet(value, STREAM_NAME_SYMBOL) as string | undefined;
       if (!name) {
         throw new WorkflowRuntimeError('WritableStream `name` is not set');
       }
@@ -1702,9 +1749,12 @@ export function getWorkflowReducers(
       // When the handle was forwarded from another run (parent → child
       // via `start()`), preserve the foreign runId so the step-side
       // reviver opens the writable against the original stream.
-      const foreignRunId = value[STREAM_SERVER_RUN_ID_SYMBOL];
+      const foreignRunId = passiveGet(value, STREAM_SERVER_RUN_ID_SYMBOL);
       if (typeof foreignRunId === 'string') s.runId = foreignRunId;
-      const foreignDeploymentId = value[STREAM_SERVER_DEPLOYMENT_ID_SYMBOL];
+      const foreignDeploymentId = passiveGet(
+        value,
+        STREAM_SERVER_DEPLOYMENT_ID_SYMBOL
+      );
       if (typeof foreignDeploymentId === 'string') {
         s.deploymentId = foreignDeploymentId;
       }
@@ -1716,26 +1766,42 @@ export function getWorkflowReducers(
     // is a plain object (not a class), so instanceof checks won't work for signals.
     // Detect instances by the presence of the ABORT_STREAM_NAME symbol instead.
     AbortController: (value) => {
-      if (!value || !value.signal) return false;
+      if (
+        value === null ||
+        (typeof value !== 'object' && typeof value !== 'function')
+      ) {
+        return false;
+      }
+      const signal = passiveGet(value, 'signal') as
+        | (AbortSignal & AbortInternals)
+        | undefined;
+      if (!signal) return false;
       const holder = value as AbortController & AbortHolder;
       const hasAbortSymbol =
-        holder[ABORT_STREAM_NAME] ?? holder.signal?.[ABORT_STREAM_NAME];
-      const isNativeAbortController =
-        global.AbortController &&
-        typeof global.AbortController === 'function' &&
-        value instanceof global.AbortController;
+        passiveGet(holder, ABORT_STREAM_NAME) ??
+        passiveGet(signal, ABORT_STREAM_NAME);
+      const isNativeAbortController = isInstanceOfPrototype(
+        value,
+        abortControllerPrototype
+      );
       if (!hasAbortSymbol && !isNativeAbortController) return false;
-      return reduceAbortBySymbol(value.signal, holder);
+      return reduceAbortBySymbol(signal, holder);
     },
     AbortSignal: (value) => {
-      const signal = value as (AbortSignal & AbortInternals) | undefined;
-      const hasAbortSymbol = signal?.[ABORT_STREAM_NAME];
-      const isNativeAbortSignal =
-        global.AbortSignal &&
-        typeof global.AbortSignal === 'function' &&
-        value instanceof global.AbortSignal;
+      if (
+        value === null ||
+        (typeof value !== 'object' && typeof value !== 'function')
+      ) {
+        return false;
+      }
+      const signal = value as AbortSignal & AbortInternals;
+      const hasAbortSymbol = passiveGet(signal, ABORT_STREAM_NAME);
+      const isNativeAbortSignal = isInstanceOfPrototype(
+        value,
+        abortSignalPrototype
+      );
       if (!hasAbortSymbol && !isNativeAbortSignal) return false;
-      return reduceAbortBySymbol(value, value as AbortHolder);
+      return reduceAbortBySymbol(signal, value as AbortHolder);
     },
   };
 }
@@ -3111,10 +3177,11 @@ export async function dehydrateStepArguments(
   key: CryptoKey | undefined,
   global: Record<string, any> = globalThis,
   v1Compat = false,
-  compression = false
+  compression = false,
+  passivityReport?: SerializationPassivityReport
 ): Promise<Uint8Array | unknown> {
   if (v1Compat) {
-    const str = stringify(value, getWorkflowReducers(global));
+    const str = stringify(value, getWorkflowReducers(global), passivityReport);
     return revive(str);
   }
   try {
@@ -3124,6 +3191,7 @@ export async function dehydrateStepArguments(
       extraReducers: getStreamAndRequestReducers(getWorkflowReducers(global)),
       compression,
       compressionStats,
+      passivityReport,
     });
     await recordCompression(compressionStats, 'serialize');
     return result;

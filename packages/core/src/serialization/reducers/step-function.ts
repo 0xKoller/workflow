@@ -18,6 +18,7 @@
  * round trip.
  */
 
+import { passiveGet, taintSerialization } from '../operations.js';
 import type { Reducers, Revivers } from '../types.js';
 
 // ---- Reducer ----
@@ -26,14 +27,17 @@ export function getStepFunctionReducer(): Partial<Reducers> {
   return {
     StepFunction: (value) => {
       if (typeof value !== 'function') return false;
-      const stepId = (value as any).stepId;
+      const stepId = passiveGet(value, 'stepId');
       if (typeof stepId !== 'string') return false;
 
-      const closureVarsFn = (value as any).__closureVarsFn;
-      const closureVars =
-        closureVarsFn && typeof closureVarsFn === 'function'
-          ? closureVarsFn()
-          : undefined;
+      const closureVarsFn = passiveGet(value, '__closureVarsFn');
+      let closureVars: Record<string, any> | undefined;
+      if (closureVarsFn && typeof closureVarsFn === 'function') {
+        // Compiler-generated, but it evaluates expressions in the workflow
+        // bundle's scope — treat it as user code.
+        taintSerialization('step function closure vars');
+        closureVars = closureVarsFn();
+      }
 
       // `__boundThis` / `__boundArgs` are marker properties added by the
       // step proxy's overridden `.bind` (see step.ts) to record the
@@ -43,8 +47,12 @@ export function getStepFunctionReducer(): Partial<Reducers> {
       // actually supplied prefilled args, so a missing property means
       // "no prefilled args".
       const hasBoundThis = '__boundThis' in (value as any);
-      const boundThis = hasBoundThis ? (value as any).__boundThis : undefined;
-      const boundArgs = (value as any).__boundArgs as unknown[] | undefined;
+      const boundThis = hasBoundThis
+        ? passiveGet(value, '__boundThis')
+        : undefined;
+      const boundArgs = passiveGet(value, '__boundArgs') as
+        | unknown[]
+        | undefined;
 
       const payload: {
         stepId: string;

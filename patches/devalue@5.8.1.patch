@@ -620,3 +620,73 @@ index 5f1df8487a35ac493ca0d3221231b773417ca031..f7219ae27ab705fcbb83b8bc5eed8efe
 +	 */
 +	operations?: Partial<StringifyOperations>;
 +}
+diff --git a/types/index.d.ts b/types/index.d.ts
+index 4385c47278eb3f2a7cb02146b13e2eba62fb6269..0a0a3880299402dad105181370799efe6ac616c5 100644
+--- a/types/index.d.ts
++++ b/types/index.d.ts
+@@ -24,16 +24,63 @@ declare module 'devalue' {
+ 	 * 
+ 	 */
+ 	export function unflatten(parsed: number | any[], revivers?: Record<string, (value: any) => any>): any;
++	/**
++	 * The introspection/extraction operations `stringify` performs on the
++	 * value being serialized. Overridable via the `operations` option to
++	 * customize how values are inspected (e.g. side-effect-free
++	 * serialization, or values living in another JavaScript runtime).
++	 */
++	export interface StringifyOperations {
++		identify: (value: any) => unknown;
++		typeOf: (value: any) => string;
++		primitive: (value: any) => any;
++		tag: (value: any) => string;
++		isThenable: (value: any) => boolean;
++		resolveThenable: (value: any) => Promise<any>;
++		unbox: (value: any) => any;
++		dateISO: (value: any) => string;
++		toStringValue: (value: any) => string;
++		regExp: (value: any) => { source: string; flags: string };
++		setValues: (value: any) => Iterable<any>;
++		mapEntries: (value: any) => Iterable<[any, any]>;
++		viewInfo: (value: any) => {
++			buffer: ArrayBufferLike;
++			byteOffset: number;
++			byteLength: number;
++			length?: number;
++			bufferByteLength: number;
++		};
++		arrayBuffer: (value: any) => ArrayBufferLike;
++		arrayLength: (value: any) => number;
++		hasOwnIndex: (value: any, index: number) => boolean;
++		arrayIndices: (value: any) => string[];
++		objectShape: (value: any) =>
++			| { kind: 'not-plain' }
++			| { kind: 'symbol-keys' }
++			| { kind: 'null-proto' | 'plain'; keys: string[] };
++		get: (value: any, key: string | number) => any;
++	}
++	export interface StringifyOptions {
++		/**
++		 * Overrides for the introspection/extraction operations used while
++		 * serializing. Unspecified operations use the defaults.
++		 */
++		operations?: Partial<StringifyOperations>;
++	}
++	/**
++	 * The default implementations of every stringify operation.
++	 */
++	export const defaultOperations: StringifyOperations;
+ 	/**
+ 	 * Turn a value into a JSON string that can be parsed with `devalue.parse`
+ 	 * 
+ 	 */
+-	export function stringify(value: any, reducers?: Record<string, (value: any) => any>): string;
++	export function stringify(value: any, reducers?: Record<string, (value: any) => any>, options?: StringifyOptions): string;
+ 	/**
+ 	 * Turn a value into a JSON string that can be parsed with `devalue.parse`
+ 	 * 
+ 	 */
+-	export function stringifyAsync(value: any, reducers?: Record<string, (value: any) => any>): Promise<string>;
++	export function stringifyAsync(value: any, reducers?: Record<string, (value: any) => any>, options?: StringifyOptions): Promise<string>;
+ 
+ 	export {};
+ }
