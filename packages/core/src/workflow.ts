@@ -29,6 +29,7 @@ import {
   dehydrateWorkflowReturnValue,
   hydrateWorkflowArguments,
 } from './serialization.js';
+import { registerRealmSerializationIntrinsics } from './serialization/operations.js';
 import { createUseStep } from './step.js';
 import {
   BODY_INIT_SYMBOL,
@@ -355,6 +356,12 @@ async function createWorkflowSession({
     seed: `${workflowRun.runId}:${workflowRun.workflowName}:${workflowRun.deploymentId}`,
     fixedTimestamp,
   });
+
+  // Capture the realm's engine Error intrinsics while it is still pristine
+  // (before the workflow bundle evaluates) so serialization can read
+  // `error.stack` from VM-created errors passively — see
+  // registerRealmSerializationIntrinsics in serialization/operations.ts.
+  registerRealmSerializationIntrinsics(vmGlobalThis);
 
   const initialInterruption = withResolvers<never>();
   let state: WorkflowSessionState = {

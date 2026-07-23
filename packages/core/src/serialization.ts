@@ -56,6 +56,7 @@ import {
   passiveGet,
   type SerializationPassivityReport,
   hardenedStringify as stringify,
+  withPassivityReport,
 } from './serialization/operations.js';
 import {
   getClassReducers,
@@ -3180,15 +3181,25 @@ export async function dehydrateStepArguments(
   compression = false,
   passivityReport?: SerializationPassivityReport
 ): Promise<Uint8Array | unknown> {
+  // Reducer construction resolves prototypes off the workflow global (see
+  // resolvePrototype) before stringify activates the report, so it must run
+  // inside the report scope too — a getter or proxy planted on a global
+  // constructor is value-owned code like any other.
   if (v1Compat) {
-    const str = stringify(value, getWorkflowReducers(global), passivityReport);
+    const reducers = withPassivityReport(passivityReport, () =>
+      getWorkflowReducers(global)
+    );
+    const str = stringify(value, reducers, passivityReport);
     return revive(str);
   }
   try {
     const compressionStats: CompressionStats = {};
+    const extraReducers = withPassivityReport(passivityReport, () =>
+      getStreamAndRequestReducers(getWorkflowReducers(global))
+    );
     const result = await stepModule.serialize(value, key, {
       global,
-      extraReducers: getStreamAndRequestReducers(getWorkflowReducers(global)),
+      extraReducers,
       compression,
       compressionStats,
       passivityReport,

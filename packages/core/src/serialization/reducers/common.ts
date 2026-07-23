@@ -29,6 +29,7 @@ import {
   capturedIntrinsics,
   intrinsicHeadersEntries,
   intrinsicMapEntries,
+  intrinsicRegExpFlags,
   intrinsicSetValues,
   isInstanceOfPrototype,
   passiveErrorStackRead,
@@ -390,7 +391,7 @@ export function getCommonReducers(
     RegExp: (value) =>
       types.isRegExp(value) && {
         source: capturedIntrinsics.regExpSource.call(value) as string,
-        flags: capturedIntrinsics.regExpFlags.call(value) as string,
+        flags: intrinsicRegExpFlags(value),
       },
     // Request and Response are intentionally NOT in common reducers.
     // They require mode-specific revivers (stream handling, etc.) and

@@ -1,7 +1,10 @@
+import { createContext, runInContext } from 'node:vm';
 import { stringify } from 'devalue';
 import { describe, expect, it } from 'vitest';
+import { dehydrateStepArguments } from '../serialization.js';
 import {
   hardenedStringify,
+  registerRealmSerializationIntrinsics,
   type SerializationPassivityReport,
 } from './operations.js';
 import { getCommonReducers } from './reducers/common.js';
@@ -241,6 +244,135 @@ describe('hardenedStringify passivity', () => {
       } finally {
         Date.prototype.toISOString = toISOString;
       }
+    });
+
+    it('serializes RegExp flags without dispatching an own flag getter', () => {
+      const value = /ab+c/gi;
+      let called = false;
+      Object.defineProperty(value, 'global', {
+        get() {
+          called = true;
+          return false; // Lie — internal-slot reads must not see this.
+        },
+      });
+      const { report, output } = run(value);
+      expect(called).toBe(false);
+      expect(report.tainted).toBe(false);
+      expect(output).toBe(
+        stringify(/ab+c/gi, getCommonReducers() as Record<string, any>)
+      );
+    });
+  });
+
+  describe('error stack reads', () => {
+    it('taints when Error.prepareStackTrace was replaced', () => {
+      const original = Object.getOwnPropertyDescriptor(
+        Error,
+        'prepareStackTrace'
+      );
+      let invoked = false;
+      Error.prepareStackTrace = (_error, _trace) => {
+        invoked = true;
+        return 'formatted';
+      };
+      try {
+        // A fresh error's `stack` is still the engine's lazy accessor;
+        // reading it would execute the replaced formatter.
+        const { report } = run(new Error('lazy'));
+        expect(report.tainted).toBe(true);
+        expect(report.reasons).toContain('Error.prepareStackTrace');
+        expect(invoked).toBe(true);
+      } finally {
+        if (original) {
+          Object.defineProperty(Error, 'prepareStackTrace', original);
+        } else {
+          (Error as { prepareStackTrace?: unknown }).prepareStackTrace =
+            undefined;
+        }
+      }
+    });
+
+    it('allows a registered realm stack getter and taints an unregistered one', () => {
+      const makeRealmError = () => {
+        const context = createContext();
+        const realmGlobal = runInContext('globalThis', context) as object;
+        const error = runInContext('new Error("realm")', context) as Error;
+        return { realmGlobal, error };
+      };
+
+      const unregistered = makeRealmError();
+      {
+        const report = freshReport();
+        hardenedStringify(
+          unregistered.error,
+          getCommonReducers(
+            unregistered.realmGlobal as typeof globalThis
+          ) as Record<string, any>,
+          report
+        );
+        expect(report.tainted).toBe(true);
+        expect(report.reasons).toContain('stack accessor');
+      }
+
+      const registered = makeRealmError();
+      registerRealmSerializationIntrinsics(registered.realmGlobal);
+      {
+        const report = freshReport();
+        hardenedStringify(
+          registered.error,
+          getCommonReducers(
+            registered.realmGlobal as typeof globalThis
+          ) as Record<string, any>,
+          report
+        );
+        expect(report.tainted).toBe(false);
+      }
+    });
+
+    it('taints when a registered realm replaced its prepareStackTrace', () => {
+      const context = createContext();
+      const realmGlobal = runInContext('globalThis', context) as object;
+      registerRealmSerializationIntrinsics(realmGlobal);
+      const error = runInContext(
+        'Error.prepareStackTrace = () => "patched"; new Error("realm")',
+        context
+      ) as Error;
+      const report = freshReport();
+      hardenedStringify(
+        error,
+        getCommonReducers(realmGlobal as typeof globalThis) as Record<
+          string,
+          any
+        >,
+        report
+      );
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('Error.prepareStackTrace');
+    });
+  });
+
+  describe('reducer construction scope', () => {
+    it('taints when reducer construction hits a getter on the workflow global', async () => {
+      const global: Record<string, any> = Object.create(globalThis);
+      let invoked = false;
+      Object.defineProperty(global, 'Request', {
+        get() {
+          invoked = true;
+          return Request;
+        },
+      });
+      const report = freshReport();
+      await dehydrateStepArguments(
+        { plain: 1 },
+        'run_test',
+        undefined,
+        global,
+        false,
+        false,
+        report
+      );
+      expect(invoked).toBe(true);
+      expect(report.tainted).toBe(true);
     });
   });
 });

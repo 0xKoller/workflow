@@ -12,7 +12,7 @@
 
 import { parse, unflatten } from 'devalue';
 import type { Codec, CodecOptions, SerializationMode } from './codec.js';
-import { hardenedStringify } from './operations.js';
+import { hardenedStringify, withPassivityReport } from './operations.js';
 import { getClassReducers, getClassRevivers } from './reducers/class.js';
 import { getCommonReducers, getCommonRevivers } from './reducers/common.js';
 import {
@@ -108,10 +108,10 @@ export const devalueCodec: Codec = {
     mode: SerializationMode,
     options?: CodecOptions
   ): Uint8Array {
-    const reducers = getReducersForMode(
-      mode,
-      options?.global,
-      options?.extraReducers
+    // Reducer construction resolves prototypes off the workflow global, so
+    // it must run inside the report scope (see dehydrateStepArguments).
+    const reducers = withPassivityReport(options?.passivityReport, () =>
+      getReducersForMode(mode, options?.global, options?.extraReducers)
     );
     const str = hardenedStringify(value, reducers, options?.passivityReport);
     return encoder.encode(str);

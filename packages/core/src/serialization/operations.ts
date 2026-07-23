@@ -100,7 +100,38 @@ const setIteratorNext = Object.getPrototypeOf(new Set().values()).next as (
 ) => IteratorResult<unknown>;
 
 const regExpSource = protoGetter(RegExp.prototype, 'source');
-const regExpFlags = protoGetter(RegExp.prototype, 'flags');
+// `RegExp.prototype.flags` is NOT internal-slot-only: the spec has it do
+// ordinary Gets of `global`, `ignoreCase`, … on the receiver, which would
+// dispatch own getters or patched per-flag accessors. Compose the flags
+// string from the individual per-flag getters instead — each of those reads
+// only the [[OriginalFlags]] internal slot. Order matches the spec'd
+// `flags` getter (d g i m s u v y), so output is byte-identical.
+const regExpFlagGetters: ReadonlyArray<
+  [flag: string, get: (this: unknown) => unknown]
+> = (
+  [
+    ['d', 'hasIndices'],
+    ['g', 'global'],
+    ['i', 'ignoreCase'],
+    ['m', 'multiline'],
+    ['s', 'dotAll'],
+    ['u', 'unicode'],
+    ['v', 'unicodeSets'],
+    ['y', 'sticky'],
+  ] as const
+).flatMap(([flag, name]) => {
+  const get = Object.getOwnPropertyDescriptor(RegExp.prototype, name)?.get;
+  return get ? [[flag, get] as [string, (this: unknown) => unknown]] : [];
+});
+
+/** A RegExp's flags string read purely from internal slots. */
+export function intrinsicRegExpFlags(value: RegExp): string {
+  let flags = '';
+  for (const [flag, get] of regExpFlagGetters) {
+    if (get.call(value)) flags += flag;
+  }
+  return flags;
+}
 
 const typedArrayPrototype = Object.getPrototypeOf(
   Uint8Array.prototype
@@ -153,7 +184,6 @@ export const capturedIntrinsics = {
   typedArrayByteOffset,
   typedArrayByteLength,
   regExpSource,
-  regExpFlags,
   urlHref,
   urlSearchParamsSize,
   urlSearchParamsToString,
@@ -245,46 +275,79 @@ export function passiveGet(
 
 // V8 materializes `error.stack` as an own *accessor* property whose getter
 // is a single engine-provided function shared by every error in a realm.
-// It formats the stack captured at construction time; treat it as passive.
-// (Known corner: the getter consults `Error.prepareStackTrace` when set, so
-// a workflow that assigns it could still run code here — accepted, same as
-// the pre-hardening behavior of reading `.stack`.)
+// It formats the stack captured at construction time, which is passive —
+// UNLESS that realm's `Error.prepareStackTrace` is set, in which case the
+// getter calls it (arbitrary realm-owned code). So a stack read is allowed
+// untainted only when (a) the own getter is a known engine stack getter for
+// its realm and (b) that realm's `Error.prepareStackTrace` is unset at read
+// time.
 const hostErrorStackGetter = Object.getOwnPropertyDescriptor(
   new Error(),
   'stack'
 )?.get;
 
-const realmErrorStackGetters = new WeakMap<
-  object,
-  ((this: unknown) => unknown) | null
->();
+interface RealmErrorIntrinsics {
+  errorCtor: ErrorConstructor;
+  stackGetter: ((this: unknown) => unknown) | undefined;
+  /**
+   * The realm's `Error.prepareStackTrace` while pristine. Node installs its
+   * own default formatter on every realm, so "unset" is wrong to test for —
+   * what matters is whether realm code *replaced* the pristine value.
+   */
+  initialPrepareStackTrace: unknown;
+}
 
-function getRealmErrorStackGetter(
-  global: object
-): ((this: unknown) => unknown) | undefined {
-  let getter = realmErrorStackGetters.get(global);
-  if (getter === undefined) {
-    getter = null;
-    try {
-      const ErrorCtor = passiveGet(global, 'Error');
-      if (typeof ErrorCtor === 'function') {
-        const descriptor = Object.getOwnPropertyDescriptor(
-          new (ErrorCtor as ErrorConstructor)('probe'),
-          'stack'
-        );
-        getter = descriptor?.get ?? null;
-      }
-    } catch {
-      // Leave null — reads fall back to the tainting path.
-    }
-    realmErrorStackGetters.set(global, getter);
-  }
-  return getter ?? undefined;
+const realmErrorIntrinsics = new WeakMap<object, RealmErrorIntrinsics>();
+
+function readPrepareStackTrace(ctor: ErrorConstructor): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(ctor, 'prepareStackTrace');
+  // An accessor for it never matches any captured data value, so it reads
+  // as "replaced" and taints — which is right, since invoking the engine
+  // stack getter would call that accessor.
+  if (descriptor === undefined || !('value' in descriptor)) return descriptor;
+  return descriptor.value;
+}
+
+/**
+ * Capture a realm's engine `Error` intrinsics from its global object. MUST
+ * be called while the realm is pristine (before any realm code evaluates):
+ * it constructs `realmGlobal.Error`, so calling it later would run whatever
+ * that binding was replaced with. workflow.ts calls this right after
+ * creating the VM context. Errors from unregistered realms simply taint on
+ * stack reads — a safe fallback, never an unsafe one.
+ */
+export function registerRealmSerializationIntrinsics(
+  realmGlobal: object
+): void {
+  if (realmErrorIntrinsics.has(realmGlobal)) return;
+  const errorCtor = (realmGlobal as { Error?: ErrorConstructor }).Error;
+  if (typeof errorCtor !== 'function') return;
+  const stackGetter = Object.getOwnPropertyDescriptor(
+    new errorCtor('probe'),
+    'stack'
+  )?.get;
+  realmErrorIntrinsics.set(realmGlobal, {
+    errorCtor,
+    stackGetter,
+    initialPrepareStackTrace: readPrepareStackTrace(errorCtor),
+  });
+}
+
+// The host realm is pristine at module load; register it like any other.
+registerRealmSerializationIntrinsics(globalThis);
+
+/** Whether realm code replaced the realm's pristine `prepareStackTrace`. */
+function prepareStackTraceReplaced(realm: RealmErrorIntrinsics): boolean {
+  return (
+    readPrepareStackTrace(realm.errorCtor) !== realm.initialPrepareStackTrace
+  );
 }
 
 /**
  * Read `error.stack` passively, allowing the engine's realm-wide lazy stack
- * getter (for the host realm and for `global`'s realm) without tainting.
+ * getter (for the host realm and for `global`'s registered realm) without
+ * tainting — unless that realm set `Error.prepareStackTrace`, which the
+ * getter would execute.
  */
 export function passiveErrorStackRead(
   error: object,
@@ -294,13 +357,27 @@ export function passiveErrorStackRead(
   if (descriptor !== undefined) {
     if ('value' in descriptor) return descriptor.value;
     if (descriptor.get === undefined) return undefined;
+    let owner: RealmErrorIntrinsics | undefined;
     if (
-      descriptor.get === hostErrorStackGetter ||
-      descriptor.get === getRealmErrorStackGetter(global)
+      hostErrorStackGetter !== undefined &&
+      descriptor.get === hostErrorStackGetter
     ) {
+      owner = realmErrorIntrinsics.get(globalThis);
+    } else {
+      const realm = realmErrorIntrinsics.get(global);
+      if (
+        realm?.stackGetter !== undefined &&
+        descriptor.get === realm.stackGetter
+      ) {
+        owner = realm;
+      }
+    }
+    if (owner !== undefined && !prepareStackTraceReplaced(owner)) {
       return descriptor.get.call(error);
     }
-    taintSerialization('stack accessor');
+    taintSerialization(
+      owner !== undefined ? 'Error.prepareStackTrace' : 'stack accessor'
+    );
     return Reflect.get(error, 'stack');
   }
   return passiveGet(error, 'stack');
@@ -414,7 +491,7 @@ const hardenedOperations = {
   regExp(value: RegExp): { source: string; flags: string } {
     return {
       source: regExpSource.call(value) as string,
-      flags: regExpFlags.call(value) as string,
+      flags: intrinsicRegExpFlags(value),
     };
   },
 
@@ -498,6 +575,27 @@ export function hardenedStringify(
   activeReport = report ?? null;
   try {
     return stringify(value, reducers, stringifyOptions);
+  } finally {
+    activeReport = previous;
+  }
+}
+
+/**
+ * Run `fn` with `report` active so `passiveGet`/`taintSerialization` calls
+ * outside of a `hardenedStringify` invocation still record into it. Needed
+ * around synchronous reducer *construction* (which resolves prototypes off
+ * the workflow global — see `resolvePrototype` in serialization.ts) so a
+ * getter or proxy planted on a global constructor taints the boundary.
+ */
+export function withPassivityReport<T>(
+  report: SerializationPassivityReport | undefined,
+  fn: () => T
+): T {
+  if (report === undefined) return fn();
+  const previous = activeReport;
+  activeReport = report;
+  try {
+    return fn();
   } finally {
     activeReport = previous;
   }
