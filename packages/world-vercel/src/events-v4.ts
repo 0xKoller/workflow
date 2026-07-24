@@ -30,6 +30,7 @@ import {
   parseRetryAfter,
 } from './http-core.js';
 import { type APIConfig, getHttpConfig } from './utils.js';
+import { getWsEventsTransport, toEventsWsUrl } from './ws-transport.js';
 
 /**
  * Issue an instrumented v4 request through the global `fetch` — NOT undici's
@@ -377,24 +378,18 @@ export async function createWorkflowRunEventV4(
   input: CreateEventV4Input,
   config?: APIConfig
 ): Promise<CreateEventV4Result> {
-  // getHttpConfig sets the Authorization header (explicit config.token or
-  // per-request OIDC fallback) — same contract as the v3 makeRequest path.
-  const { baseUrl, headers: baseHeaders } = await getHttpConfig(config);
-  const headers = new Headers(baseHeaders);
-  headers.set('Content-Type', 'application/octet-stream');
+  const meta = buildPostFrameMeta(input);
+  const payload = input.payload ?? new Uint8Array(0);
 
-  const frame = encodeFrame(
-    buildPostFrameMeta(input),
-    input.payload ?? new Uint8Array(0)
-  );
-
-  const url = `${baseUrl}/v4/runs/${encodeURIComponent(input.runId)}/events/${encodeURIComponent(input.eventType)}`;
-  const response = await fetchV4(
-    url,
-    { method: 'POST', headers, body: frame },
-    config,
-    'createEvent'
-  );
+  const response = isWsEventsTransportEnabled()
+    ? await postEventFrameOverWs(input.runId, meta, payload, config)
+    : await postEventFrameOverHttp(
+        input.runId,
+        input.eventType,
+        meta,
+        payload,
+        config
+      );
 
   const eventId = response.headers.get(V4_RESPONSE_HEADERS.eventId);
   const runId = response.headers.get(V4_RESPONSE_HEADERS.runId);
@@ -415,6 +410,109 @@ export async function createWorkflowRunEventV4(
       : {};
 
   return { eventId, runId, createdAt, body };
+}
+
+/**
+ * A `Response`-like contract: the only two members `createWorkflowRunEventV4`
+ * reads off the transport result. `fetch`'s `Response` satisfies this
+ * structurally, so the HTTP branch returns a real `Response` unchanged; the
+ * WS branch builds a minimal object with the same shape instead of forcing
+ * WS replies to imitate HTTP status/headers any further than this.
+ */
+interface FrameResponseLike {
+  headers: { get(name: string): string | null };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+/**
+ * WS events transport gate — POC flag (see workflow-architecture.md notes).
+ * Only `createWorkflowRunEventV4` (POST) is wired to it; GET/LIST stay on
+ * HTTP, since they're not on the hot per-step path and the wire protocol
+ * for LIST (a streamed, sentinel-terminated multi-frame response) doesn't
+ * map onto a single WS message.
+ */
+export function isWsEventsTransportEnabled(): boolean {
+  return process.env.WORKFLOW_EVENTS_TRANSPORT === 'ws';
+}
+
+async function postEventFrameOverHttp(
+  runId: string,
+  eventType: string,
+  meta: Record<string, unknown>,
+  payload: Uint8Array,
+  config: APIConfig | undefined
+): Promise<FrameResponseLike> {
+  // getHttpConfig sets the Authorization header (explicit config.token or
+  // per-request OIDC fallback) — same contract as the v3 makeRequest path.
+  const { baseUrl, headers: baseHeaders } = await getHttpConfig(config);
+  const headers = new Headers(baseHeaders);
+  headers.set('Content-Type', 'application/octet-stream');
+
+  const frame = encodeFrame(meta, payload);
+  const url = `${baseUrl}/v4/runs/${encodeURIComponent(runId)}/events/${encodeURIComponent(eventType)}`;
+  return fetchV4(
+    url,
+    { method: 'POST', headers, body: frame },
+    config,
+    'createEvent'
+  );
+}
+
+/** Flatten the reply frame's meta into the small header record
+ *  `errorFromV4Response` already knows how to read (retry-after,
+ *  x-vercel-mitigated) — reuses that function unchanged instead of growing
+ *  a WS-specific error path. */
+function replyMetaToHeaderRecord(
+  meta: Record<string, unknown>
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (typeof meta.eventId === 'string')
+    out[V4_RESPONSE_HEADERS.eventId] = meta.eventId;
+  if (typeof meta.runId === 'string')
+    out[V4_RESPONSE_HEADERS.runId] = meta.runId;
+  if (typeof meta.createdAt === 'string')
+    out[V4_RESPONSE_HEADERS.createdAt] = meta.createdAt;
+  if (typeof meta.retryAfter === 'string') out['retry-after'] = meta.retryAfter;
+  if (typeof meta.mitigated === 'string')
+    out['x-vercel-mitigated'] = meta.mitigated;
+  return out;
+}
+
+async function postEventFrameOverWs(
+  runId: string,
+  meta: Record<string, unknown>,
+  payload: Uint8Array,
+  config: APIConfig | undefined
+): Promise<FrameResponseLike> {
+  const { baseUrl, headers } = await getHttpConfig(config);
+  const wsUrl = toEventsWsUrl(baseUrl);
+  const transport = getWsEventsTransport(wsUrl, headersToRecord(headers));
+
+  // runId travels in-band in the meta here — over HTTP it comes from the URL
+  // path instead, since there's no per-message URL on a shared WS
+  // connection. parseV4EventMeta ignores unknown fields, so this is a no-op
+  // on the HTTP branch (which never sets it).
+  const reply = await transport.request((reqId) =>
+    encodeFrame({ ...meta, runId, reqId }, payload)
+  );
+
+  const status =
+    typeof reply.meta.status === 'number' ? reply.meta.status : 200;
+  if (status < 200 || status >= 300) {
+    throw errorFromV4Response(
+      status,
+      replyMetaToHeaderRecord(reply.meta),
+      new TextDecoder().decode(reply.body),
+      'createEvent',
+      `${wsUrl}#runs/${encodeURIComponent(runId)}/events`
+    );
+  }
+
+  const headerRecord = replyMetaToHeaderRecord(reply.meta);
+  return {
+    headers: { get: (name) => headerRecord[name.toLowerCase()] ?? null },
+    arrayBuffer: async () => reply.body.slice().buffer as ArrayBuffer,
+  };
 }
 
 /**
