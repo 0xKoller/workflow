@@ -57,12 +57,6 @@ export interface SuspensionHandlerParams {
    * where `run_started` was already awaited up front.
    */
   runReadyBarrier?: Promise<unknown>;
-  /**
-   * Record whether serializing new step inputs executed workflow code (see
-   * `retainedStepInputsSafe`). Enabled only while the caller is holding a
-   * retained VM.
-   */
-  prepareForRetention?: boolean;
 }
 
 /**
@@ -133,7 +127,6 @@ export interface SuspensionHandlerResult {
    * not execute workflow-owned code such as getters, proxy traps, or custom
    * serializers). `false` means the retained VM may have diverged from what
    * a cold replay would compute, so the caller must demote to replay.
-   * Always `true` when `prepareForRetention` was not set.
    */
   retainedStepInputsSafe: boolean;
 }
@@ -220,7 +213,6 @@ export async function handleSuspension({
   requestId,
   eventLog,
   runReadyBarrier,
-  prepareForRetention = false,
 }: SuspensionHandlerParams): Promise<SuspensionHandlerResult> {
   const runId = run.runId;
 
@@ -515,8 +507,10 @@ export async function handleSuspension({
   // taints it, the caller demotes the session so the side effects land in a
   // VM that is about to be discarded, exactly like the pre-retention
   // runtime.
-  const passivityReport: SerializationPassivityReport | undefined =
-    prepareForRetention ? { tainted: false, reasons: [] } : undefined;
+  const passivityReport: SerializationPassivityReport = {
+    tainted: false,
+    reasons: [],
+  };
 
   // Lazy inline start: defer the step_created write for up to
   // `getMaxInlineSteps()` steps the caller will run inline (in parallel). Each
@@ -705,8 +699,8 @@ export async function handleSuspension({
   await Promise.all(ops);
 
   // The step-input dehydrations above have settled, so the report is final.
-  const retainedStepInputsSafe = !passivityReport?.tainted;
-  if (passivityReport?.tainted) {
+  const retainedStepInputsSafe = !passivityReport.tainted;
+  if (passivityReport.tainted) {
     runtimeLogger.debug(
       'Serializing step inputs executed workflow code; falling back to replay instead of retaining the VM',
       { workflowRunId: runId, reasons: passivityReport.reasons }

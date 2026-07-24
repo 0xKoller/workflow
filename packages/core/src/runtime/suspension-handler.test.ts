@@ -413,10 +413,7 @@ describe('retainedStepInputsSafe (serialization passivity gate)', () => {
     ]);
   }
 
-  async function runSuspension(
-    args: unknown[],
-    { prepareForRetention = true } = {}
-  ) {
+  async function runSuspension(args: unknown[]) {
     const eventsCreate = vi
       .fn()
       .mockImplementation(async (_runId, event) => ({ event }));
@@ -425,7 +422,6 @@ describe('retainedStepInputsSafe (serialization passivity gate)', () => {
       suspension: new WorkflowSuspension(stepPending(args), globalThis),
       world,
       run,
-      prepareForRetention,
     });
   }
 
@@ -471,21 +467,11 @@ describe('retainedStepInputsSafe (serialization passivity gate)', () => {
       suspension: new WorkflowSuspension(stepPending([value]), globalThis),
       world,
       run,
-      prepareForRetention: true,
     });
     expect(result.retainedStepInputsSafe).toBe(false);
     // The step is still prepared for execution as usual.
     expect(
       result.lazyInlineSteps.length + result.createdStepCorrelationIds.size
     ).toBeGreaterThan(0);
-  });
-
-  it('always reports safe when not preparing for retention', async () => {
-    const value: Record<string, unknown> = {};
-    Object.defineProperty(value, 'lazy', { enumerable: true, get: () => 1 });
-    const result = await runSuspension([value], {
-      prepareForRetention: false,
-    });
-    expect(result.retainedStepInputsSafe).toBe(true);
   });
 });
