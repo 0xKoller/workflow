@@ -41,6 +41,10 @@ import {
   isSealTarget,
   type PayloadKey,
   resolveEncryptionKey,
+  runPayloadKeys,
+  type RunPayloadKeys,
+  sealTo,
+  type SealTarget,
 } from './serialization/encryption.js';
 import {
   formatSerializationError,
@@ -108,6 +112,15 @@ export {
   compress,
   decompress,
   type EncryptionKeyParam,
+  // Sealed-box ('encp') key variants — see serialization/encryption.ts.
+  type PayloadKey,
+  type RunPayloadKeys,
+  type SealTarget,
+  sealTo,
+  runPayloadKeys,
+  isSealTarget,
+  isRunPayloadKeys,
+  aesKeyOf,
 };
 
 // Re-export the legacy SerializationFormatType for backwards compatibility.
