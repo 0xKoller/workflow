@@ -566,10 +566,24 @@ const hardenedOperations = {
   },
 
   arrayLength(value: unknown[]): number {
-    // On a genuine array `length` is an own data property, so this reads the
-    // same value as `value.length`; on a tag-spoofing object with a `length`
-    // accessor it taints first and then reads like the default would.
+    if (!Array.isArray(value)) {
+      // Tag-spoofed 'Array': the serializer loop coerces this length (which
+      // can run an object-valued length's valueOf/Symbol.toPrimitive), so
+      // taint and preserve the stock read.
+      taintSerialization('Array tag without Array brand');
+      return defaultOperations.arrayLength(value);
+    }
+    // On a genuine array `length` is an own (non-configurable) data property.
     return passiveGet(value, 'length') as number;
+  },
+
+  arrayBuffer(value: ArrayBuffer): ArrayBuffer {
+    if (!types.isArrayBuffer(value) && !types.isSharedArrayBuffer(value)) {
+      // Tag-spoofed 'ArrayBuffer': base64 encoding coerces it through
+      // Uint8Array/Buffer, which can execute value-owned code.
+      taintSerialization('ArrayBuffer tag without ArrayBuffer brand');
+    }
+    return defaultOperations.arrayBuffer(value);
   },
 
   viewInfo(value: ArrayBufferView): {
@@ -613,20 +627,31 @@ const hardenedOperations = {
     // prototype's own property names) to detect plain objects. Both run
     // traps when the *prototype* is a Proxy — the value itself already
     // taints at typeOf — so taint that case before the default touches it.
-    // Deeper chain members are only read as values, never trapped.
-    const proto = Object.getPrototypeOf(value);
-    if (proto !== null && types.isProxy(proto)) {
-      taintSerialization('proxy in prototype chain');
+    // Deeper chain members are only read as values, never trapped. Skip the
+    // probe for Proxy values (already tainted): it would run their
+    // getPrototypeOf trap one extra time relative to stock devalue.
+    if (!types.isProxy(value)) {
+      const proto = Object.getPrototypeOf(value);
+      if (proto !== null && types.isProxy(proto)) {
+        taintSerialization('proxy in prototype chain');
+      }
     }
     return defaultOperations.objectShape(value);
   },
 
   get(value: object, key: string | number): unknown {
-    // devalue only reads keys it discovered via Object.keys/Object.hasOwn,
-    // so a missing descriptor can only mean a lying proxy — which already
-    // tainted at typeOf. Reading own data properties from the descriptor
-    // never executes code; own accessors taint and then run exactly as a
-    // plain `value[key]` read would.
+    if (types.isProxy(value)) {
+      // A Proxy's `get` trap may return something other than the target's
+      // descriptor value (stock devalue reads `value[key]` through the
+      // trap). Taint — typeOf already did, but `get` can also be reached
+      // through reducer-produced wrappers — and preserve the stock read.
+      taintSerialization('proxy');
+      return Reflect.get(value, key);
+    }
+    // devalue only reads keys it discovered via Object.keys/Object.hasOwn.
+    // Reading own data properties from the descriptor never executes code;
+    // own accessors taint and then run exactly as a plain `value[key]` read
+    // would.
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor !== undefined && 'value' in descriptor) {
       return descriptor.value;

@@ -128,6 +128,45 @@ describe('hardenedStringify passivity', () => {
       expect(report.reasons).toContain('proxy');
     });
 
+    it('reads proxy properties through the trap, matching stock bytes', () => {
+      const proxy = new Proxy(
+        { a: 1 },
+        { get: (target, key) => (key === 'a' ? 2 : Reflect.get(target, key)) }
+      );
+      const reducers = getCommonReducers() as Record<
+        string,
+        (value: any) => any
+      >;
+      const report = freshReport();
+      const output = hardenedStringify({ p: proxy }, reducers, report);
+      expect(output).toBe(stringify({ p: proxy }, reducers));
+      expect(output).toBe(stringify({ p: { a: 2 } }, reducers));
+      expect(report.tainted).toBe(true);
+    });
+
+    it('taints a tag-spoofed Array-like whose length coerces via valueOf', () => {
+      let coerced = 0;
+      const arrayLike = {
+        [Symbol.toStringTag]: 'Array',
+        length: {
+          valueOf() {
+            coerced++;
+            return 0;
+          },
+        },
+      };
+      const reducers = getCommonReducers() as Record<
+        string,
+        (value: any) => any
+      >;
+      const report = freshReport();
+      const output = hardenedStringify(arrayLike, reducers, report);
+      expect(output).toBe(stringify(arrayLike, reducers));
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('Array tag without Array brand');
+      expect(coerced).toBeGreaterThan(0);
+    });
+
     it('taints on an array getter element', () => {
       const arr: unknown[] = [1];
       Object.defineProperty(arr, 1, { enumerable: true, get: () => 2 });

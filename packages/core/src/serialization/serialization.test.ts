@@ -966,9 +966,9 @@ describe('devalue codec', () => {
     }
   });
 
-  it('should support deserializeLegacy', () => {
+  it('should support deserializeLegacy', async () => {
     // Simulate legacy data (devalue unflatten format)
-    const { stringify } = require('devalue');
+    const { stringify } = await import('../vendor/devalue/index.js');
     const value = { test: 'legacy' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test
@@ -1131,9 +1131,9 @@ describe('workflow.serialize / workflow.deserialize', () => {
     expect(() => workflow.serialize(fn)).toThrow(/Failed to serialize/);
   });
 
-  it('should deserialize legacy non-binary data', () => {
+  it('should deserialize legacy non-binary data', async () => {
     // Simulate legacy format (devalue unflatten array)
-    const { stringify } = require('devalue');
+    const { stringify } = await import('../vendor/devalue/index.js');
     const value = { hello: 'world' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test
@@ -1222,7 +1222,7 @@ describe('step.serialize / step.deserialize', () => {
   });
 
   it('should deserialize legacy non-binary data', async () => {
-    const { stringify } = require('devalue');
+    const { stringify } = await import('../vendor/devalue/index.js');
     const value = { hello: 'step' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test
