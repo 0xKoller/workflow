@@ -1,5 +1,27 @@
 # workflow
 
+## 5.0.0-beta.37
+
+### Major Changes
+
+- [#3061](https://github.com/vercel/workflow/pull/3061) [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Remove the retired step route runtime and make queue health checks target the combined flow handler.
+
+### Patch Changes
+
+- Updated dependencies [[`f11e9fe`](https://github.com/vercel/workflow/commit/f11e9fe56f49f3477a2aee15dabc7774928b1428), [`fd05393`](https://github.com/vercel/workflow/commit/fd05393d2b47d1a2f347538dd3b6062d808548d2), [`fc81f45`](https://github.com/vercel/workflow/commit/fc81f4502fa6d8d9a7a5c48b44394dc39c141a86), [`3069b49`](https://github.com/vercel/workflow/commit/3069b4918edb82f12a45d2014dc465aee03e9c39), [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91), [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91), [`b610c46`](https://github.com/vercel/workflow/commit/b610c46f8143afe3c862fb9957f5b4b48e754b42)]:
+  - @workflow/next@5.0.0-beta.37
+  - @workflow/core@5.0.0-beta.37
+  - @workflow/cli@5.0.0-beta.37
+  - @workflow/nitro@5.0.0-beta.37
+  - @workflow/utils@5.0.0-beta.7
+  - @workflow/errors@5.0.0-beta.13
+  - @workflow/astro@5.0.0-beta.37
+  - @workflow/nest@5.0.0-beta.37
+  - @workflow/nuxt@5.0.0-beta.37
+  - @workflow/rollup@5.0.0-beta.37
+  - @workflow/sveltekit@5.0.0-beta.37
+  - @workflow/typescript-plugin@5.0.0-beta.5
+
 ## 5.0.0-beta.36
 
 ### Minor Changes

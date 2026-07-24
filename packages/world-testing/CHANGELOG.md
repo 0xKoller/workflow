@@ -1,5 +1,21 @@
 # @workflow/world-testing
 
+## 5.0.0-beta.37
+
+### Patch Changes
+
+- [#3055](https://github.com/vercel/workflow/pull/3055) [`6670e08`](https://github.com/vercel/workflow/commit/6670e08c7db156e335c4d2c9e57952fdb9ee94e2) Thanks [@VaguelySerious](https://github.com/VaguelySerious)! - Fix flaky Local World tests caused by concurrent test servers sharing one data directory and re-enqueuing each other's in-flight runs on startup
+
+- [#3061](https://github.com/vercel/workflow/pull/3061) [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Remove the standalone step URL API and stale generated route artifacts while keeping step registrations inside the combined flow output.
+
+- Updated dependencies [[`fd05393`](https://github.com/vercel/workflow/commit/fd05393d2b47d1a2f347538dd3b6062d808548d2), [`fc81f45`](https://github.com/vercel/workflow/commit/fc81f4502fa6d8d9a7a5c48b44394dc39c141a86), [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91), [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91), [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91), [`b610c46`](https://github.com/vercel/workflow/commit/b610c46f8143afe3c862fb9957f5b4b48e754b42)]:
+  - @workflow/core@5.0.0-beta.37
+  - @workflow/world@5.0.0-beta.23
+  - @workflow/cli@5.0.0-beta.37
+  - @workflow/utils@5.0.0-beta.7
+  - @workflow/world-local@5.0.0-beta.31
+  - workflow@5.0.0-beta.37
+
 ## 5.0.0-beta.36
 
 ### Patch Changes

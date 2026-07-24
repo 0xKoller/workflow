@@ -1,5 +1,14 @@
 # @workflow/web
 
+## 5.0.0-beta.37
+
+### Patch Changes
+
+- [#3061](https://github.com/vercel/workflow/pull/3061) [`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Check only the combined workflow endpoint in the observability health check.
+
+- Updated dependencies [[`62d570e`](https://github.com/vercel/workflow/commit/62d570ed4bf38db333ae9fe9ba513c0d6a9d6b91)]:
+  - @workflow/world-local@5.0.0-beta.31
+
 ## 5.0.0-beta.36
 
 ### Patch Changes
