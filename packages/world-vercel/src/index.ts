@@ -3,12 +3,14 @@ import { SPEC_VERSION_SUPPORTS_COMPRESSION } from '@workflow/world';
 import { createAnalytics } from './analytics.js';
 import { createRunId, describeRun } from './create-run-id.js';
 import { createGetEncryptionKeyForRun } from './encryption.js';
+import { isWsEventsTransportEnabled } from './events-v4.js';
 import { instrumentObject } from './instrumentObject.js';
 import { createQueue } from './queue.js';
 import { createResolveLatestDeploymentId } from './resolve-latest-deployment.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
-import type { APIConfig } from './utils.js';
+import { type APIConfig, getHttpUrl } from './utils.js';
+import { toEventsWsUrl } from './ws-transport.js';
 
 export { createAnalytics } from './analytics.js';
 export { createRunId, describeRun, regionForRunId } from './create-run-id.js';
@@ -17,10 +19,38 @@ export {
   deriveRunKey,
   fetchRunKey,
 } from './encryption.js';
+export { isWsEventsTransportEnabled } from './events-v4.js';
 export { createQueue } from './queue.js';
 export { createStorage } from './storage.js';
 export { createStreamer } from './streamer.js';
-export type { APIConfig } from './utils.js';
+export {
+  type APIConfig,
+  getHttpUrl,
+  WORKFLOW_SERVER_URL_OVERRIDE,
+} from './utils.js';
+export { toEventsWsUrl } from './ws-transport.js';
+
+/**
+ * POC debug helper: the resolved workflow-server base URL and (if the WS
+ * events transport is enabled) the derived WS URL, for surfacing in a UI to
+ * confirm which backend/transport a deployment is actually configured to
+ * hit. Not meant to survive past the http->ws exploration.
+ */
+export function debugWorkflowServerTarget(config?: APIConfig): {
+  baseUrl: string;
+  usingProxy: boolean;
+  wsEventsEnabled: boolean;
+  wsUrl?: string;
+} {
+  const { baseUrl, usingProxy } = getHttpUrl(config);
+  const wsEventsEnabled = isWsEventsTransportEnabled();
+  return {
+    baseUrl,
+    usingProxy,
+    wsEventsEnabled,
+    ...(wsEventsEnabled ? { wsUrl: toEventsWsUrl(baseUrl) } : {}),
+  };
+}
 
 export function createWorld(config?: APIConfig): World {
   // Project ID for HKDF key derivation context.
