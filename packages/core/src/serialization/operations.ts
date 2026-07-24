@@ -366,13 +366,29 @@ const realmErrorIntrinsics = new pristine.WeakMap() as WeakMap<
   RealmErrorIntrinsics
 >;
 
+/**
+ * The engine resolves `Error.prepareStackTrace` with an ordinary Get on the
+ * realm's Error constructor, so an *inherited* formatter (e.g. planted on
+ * that realm's `Function.prototype`) is honored too. Replicate the lookup
+ * passively: walk own descriptors up the constructor's prototype chain and
+ * return the first data value found. Anything that cannot be read without
+ * running realm code (an accessor, a Proxy on the chain) resolves to a
+ * fresh object, which never matches any captured baseline — the stack read
+ * then taints, which is right, since invoking the engine stack getter would
+ * run that code.
+ */
 function readPrepareStackTrace(ctor: ErrorConstructor): unknown {
-  const descriptor = getOwnPropertyDescriptor(ctor, 'prepareStackTrace');
-  // An accessor for it never matches any captured data value, so it reads
-  // as "replaced" and taints — which is right, since invoking the engine
-  // stack getter would call that accessor.
-  if (descriptor === undefined || !('value' in descriptor)) return descriptor;
-  return descriptor.value;
+  let node: object | null = ctor;
+  while (node !== null) {
+    if (types.isProxy(node)) return { unreadable: 'proxy' };
+    const descriptor = getOwnPropertyDescriptor(node, 'prepareStackTrace');
+    if (descriptor !== undefined) {
+      if ('value' in descriptor) return descriptor.value;
+      return descriptor;
+    }
+    node = getPrototypeOf(node);
+  }
+  return undefined;
 }
 
 /**
@@ -485,6 +501,34 @@ export function isInstanceOfPrototype(
  * descriptors up the prototype chain (same inherited-property semantics as
  * `in`), tainting and falling back to `Reflect.has` when a Proxy appears.
  */
+/**
+ * Resolved by `passivePeek` when reading the property would require running
+ * value-owned code (an accessor, or a Proxy anywhere on the chain).
+ */
+export const PEEK_BLOCKED: unique symbol = Symbol('workflow.peekBlocked');
+
+/**
+ * Resolve `key` along `value`'s prototype chain with Get semantics but
+ * without invoking *anything*: a data property resolves to its value, a
+ * missing property to undefined, and anything that would need to run code
+ * to read (accessor property, Proxy on the chain) resolves to
+ * `PEEK_BLOCKED`. Unlike `passiveGet`, this neither taints nor performs the
+ * read — callers use it to choose between a known-passive fast path and a
+ * tainted dynamic dispatch that must run exactly once.
+ */
+export function passivePeek(value: object, key: string | symbol): unknown {
+  let target: object | null = value;
+  while (target !== null) {
+    if (types.isProxy(target)) return PEEK_BLOCKED;
+    const descriptor = getOwnPropertyDescriptor(target, key);
+    if (descriptor !== undefined) {
+      return 'value' in descriptor ? descriptor.value : PEEK_BLOCKED;
+    }
+    target = getPrototypeOf(target);
+  }
+  return undefined;
+}
+
 export function passiveHas(value: object, key: string | symbol): boolean {
   let target: object | null = value;
   if (types.isProxy(target)) {

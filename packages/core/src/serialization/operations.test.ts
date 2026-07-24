@@ -391,6 +391,25 @@ describe('hardenedStringify passivity', () => {
       expect(output).toBe(run(new URLSearchParams('x=y')).output);
     });
 
+    it('invokes a URLSearchParams toString conversion getter exactly once', () => {
+      // The probe that selects the native fast path must not perform reads:
+      // a stateful conversion getter has to fire exactly once, from the
+      // single `String(value)` dispatch, like it did pre-hardening.
+      const params = new URLSearchParams('a=1');
+      let reads = 0;
+      Object.defineProperty(params, 'toString', {
+        configurable: true,
+        get() {
+          reads++;
+          return () => 'x=y';
+        },
+      });
+      const { output, report } = run(params);
+      expect(reads).toBe(1);
+      expect(report.tainted).toBe(true);
+      expect(output).toBe(run(new URLSearchParams('x=y')).output);
+    });
+
     it('serializes RegExp flags without dispatching an own flag getter', () => {
       const value = /ab+c/gi;
       let called = false;
@@ -525,6 +544,32 @@ describe('hardenedStringify passivity', () => {
         );
         expect(report.tainted).toBe(false);
       }
+    });
+
+    it('taints when a registered realm planted an inherited prepareStackTrace', () => {
+      // The engine resolves Error.prepareStackTrace with an ordinary Get on
+      // the realm's Error constructor, so a formatter inherited from the
+      // realm's Function.prototype is honored too and must read as
+      // "replaced".
+      const context = createContext();
+      const realmGlobal = runInContext('globalThis', context) as object;
+      registerRealmSerializationIntrinsics(realmGlobal);
+      const error = runInContext(
+        'Object.getPrototypeOf(Error).prepareStackTrace = () => "inherited";' +
+          'new Error("realm")',
+        context
+      ) as Error;
+      const report = freshReport();
+      hardenedStringify(
+        error,
+        getCommonReducers(realmGlobal as typeof globalThis) as Record<
+          string,
+          any
+        >,
+        report
+      );
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('Error.prepareStackTrace');
     });
 
     it('taints when a registered realm replaced its prepareStackTrace', () => {

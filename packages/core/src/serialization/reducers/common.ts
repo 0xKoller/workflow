@@ -35,6 +35,7 @@ import {
   passiveErrorStackRead,
   passiveGet,
   passiveHas,
+  passivePeek,
   taintSerialization,
 } from '../operations.js';
 import type { Reducers, Revivers, SerializableSpecial } from '../types.js';
@@ -444,12 +445,15 @@ export function getCommonReducers(
         return passiveGet(value as object, 'size') === 0 ? '.' : String(value);
       }
       if (nativeString === '') return '.';
-      // Nonempty: previous behavior dispatched `String(value)`. Keep those
-      // bytes — use the captured toString when the value resolves to it, and
-      // taint + dispatch dynamically otherwise.
+      // Nonempty: previous behavior dispatched `String(value)` exactly once.
+      // Take the captured-native result only when a descriptor-level peek
+      // (which invokes nothing) proves the dispatch would resolve to the
+      // captured toString; otherwise taint and dispatch exactly once — a
+      // conversion *getter* must not be invoked by a probe and then again
+      // by `String(value)`.
       if (
-        passiveGet(value as object, Symbol.toPrimitive) === undefined &&
-        passiveGet(value as object, 'toString') ===
+        passivePeek(value as object, Symbol.toPrimitive) === undefined &&
+        passivePeek(value as object, 'toString') ===
           capturedIntrinsics.urlSearchParamsToString
       ) {
         return nativeString;
