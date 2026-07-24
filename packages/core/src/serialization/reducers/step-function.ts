@@ -18,7 +18,7 @@
  * round trip.
  */
 
-import { passiveGet, taintSerialization } from '../operations.js';
+import { passiveGet, passiveHas, taintSerialization } from '../operations.js';
 import type { Reducers, Revivers } from '../types.js';
 
 // ---- Reducer ----
@@ -41,12 +41,12 @@ export function getStepFunctionReducer(): Partial<Reducers> {
 
       // `__boundThis` / `__boundArgs` are marker properties added by the
       // step proxy's overridden `.bind` (see step.ts) to record the
-      // bound receiver and any prefilled arguments. Use `in` for
-      // `__boundThis` so we round-trip even when the bound `this` is
+      // bound receiver and any prefilled arguments. Use a presence check
+      // for `__boundThis` so we round-trip even when the bound `this` is
       // `undefined`/`null`. `__boundArgs` is only set when the user
       // actually supplied prefilled args, so a missing property means
       // "no prefilled args".
-      const hasBoundThis = '__boundThis' in (value as any);
+      const hasBoundThis = passiveHas(value, '__boundThis');
       const boundThis = hasBoundThis
         ? passiveGet(value, '__boundThis')
         : undefined;

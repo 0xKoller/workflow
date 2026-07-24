@@ -34,6 +34,7 @@ import {
   isInstanceOfPrototype,
   passiveErrorStackRead,
   passiveGet,
+  passiveHas,
   taintSerialization,
 } from '../operations.js';
 import type { Reducers, Revivers, SerializableSpecial } from '../types.js';
@@ -129,7 +130,7 @@ function reduceErrorBase(
     message: passiveGet(value, 'message') as string,
     stack: passiveErrorStackRead(value, global) as string | undefined,
   };
-  if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
+  if (passiveHas(value, 'cause')) reduced.cause = passiveGet(value, 'cause');
   return reduced;
 }
 
@@ -256,7 +257,9 @@ export function getCommonReducers(
         ) as string,
         stack: passiveErrorStackRead(value, global) as string | undefined,
       };
-      if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
+      if (passiveHas(value, 'cause')) {
+        reduced.cause = passiveGet(value, 'cause');
+      }
       return reduced;
     },
     // Error subclass reducers are intentionally placed before the base Error
@@ -371,7 +374,9 @@ export function getCommonReducers(
         message: passiveGet(value, 'message') as string,
         stack: passiveErrorStackRead(value, global) as string | undefined,
       };
-      if ('cause' in value) reduced.cause = passiveGet(value, 'cause');
+      if (passiveHas(value, 'cause')) {
+        reduced.cause = passiveGet(value, 'cause');
+      }
       return reduced;
     },
     Float32Array: (value) => types.isFloat32Array(value) && viewToBase64(value),

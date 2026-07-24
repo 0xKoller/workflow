@@ -153,6 +153,86 @@ describe('hardenedStringify passivity', () => {
       expect(report.tainted).toBe(true);
     });
 
+    it('taints on a plain-looking object with a Proxy prototype', () => {
+      // A Proxy around Object.prototype passes devalue's is_plain_object
+      // check (through its traps), so stock devalue serializes the object
+      // as plain while the traps run. The hardened objectShape must taint.
+      let trapped = 0;
+      const proto = new Proxy(Object.prototype, {
+        getPrototypeOf(target) {
+          trapped++;
+          return Object.getPrototypeOf(target);
+        },
+      });
+      const value = Object.assign(Object.create(proto), { a: 1 });
+      const reducers = getCommonReducers() as Record<
+        string,
+        (value: any) => any
+      >;
+      const report = freshReport();
+      const output = hardenedStringify({ wrapper: value }, reducers, report);
+      expect(output).toBe(stringify({ wrapper: value }, reducers));
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('proxy in prototype chain');
+      expect(trapped).toBeGreaterThan(0);
+    });
+
+    it('taints on an Error with a Proxy in its prototype chain', () => {
+      const error = new TypeError('t');
+      Object.setPrototypeOf(
+        error,
+        new Proxy(TypeError.prototype, {
+          has(target, key) {
+            return Reflect.has(target, key);
+          },
+        })
+      );
+      // Give the error own data props so reducers read it without accessors.
+      Object.defineProperties(error, {
+        name: { value: 'TypeError', enumerable: false },
+        message: { value: 't', enumerable: false },
+        stack: { value: 'fixed', enumerable: false, writable: true },
+      });
+      const { report } = run(error);
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('proxy in prototype chain');
+    });
+
+    it('taints a tag-spoofed Map-like instead of throwing, preserving stock bytes', () => {
+      const mapLike = {
+        [Symbol.toStringTag]: 'Map',
+        *[Symbol.iterator](): Generator<[unknown, unknown]> {
+          yield ['k', 1];
+        },
+      };
+      const reducers = getCommonReducers() as Record<
+        string,
+        (value: any) => any
+      >;
+      const report = freshReport();
+      const output = hardenedStringify(mapLike, reducers, report);
+      expect(output).toBe(stringify(mapLike, reducers));
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('Map tag without Map brand');
+    });
+
+    it('taints a tag-spoofed Date-like instead of throwing, preserving stock bytes', () => {
+      const dateLike = {
+        [Symbol.toStringTag]: 'Date',
+        getDate: () => 1,
+        toISOString: () => '2024-01-01T00:00:00.000Z',
+      };
+      const reducers = getCommonReducers() as Record<
+        string,
+        (value: any) => any
+      >;
+      const report = freshReport();
+      const output = hardenedStringify(dateLike, reducers, report);
+      expect(output).toBe(stringify(dateLike, reducers));
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('Date tag without Date brand');
+    });
+
     it('caps and dedupes taint reasons', () => {
       const mk = (key: string) => {
         const o: Record<string, unknown> = {};

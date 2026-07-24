@@ -34,7 +34,7 @@
  */
 
 import { types } from 'node:util';
-import { stringify } from '../vendor/devalue/index.js';
+import { defaultOperations, stringify } from '../vendor/devalue/index.js';
 
 // ---------------------------------------------------------------------------
 // Passivity taint context
@@ -395,16 +395,49 @@ export function passiveErrorStackRead(
  * `value instanceof C` without dispatching `C[Symbol.hasInstance]`: walks
  * the value's prototype chain looking for `prototype`. Matches instanceof
  * for ordinary classes; ignores hasInstance spoofing by design.
+ *
+ * Calling `Object.getPrototypeOf` on a Proxy runs its `getPrototypeOf` trap
+ * (user code), so any Proxy encountered on the chain taints before the walk
+ * touches it. The walk still proceeds — the taint demotes retention, after
+ * which running the trap is as safe as it was pre-retention.
  */
 export function isInstanceOfPrototype(
   value: unknown,
   prototype: object | undefined | null
 ): boolean {
   if (!prototype || value === null || typeof value !== 'object') return false;
-  let proto = Object.getPrototypeOf(value);
-  while (proto !== null) {
+  let node: object = value;
+  for (;;) {
+    if (types.isProxy(node)) {
+      taintSerialization('proxy in prototype chain');
+    }
+    const proto: object | null = Object.getPrototypeOf(node);
+    if (proto === null) return false;
     if (proto === prototype) return true;
-    proto = Object.getPrototypeOf(proto);
+    node = proto;
+  }
+}
+
+/**
+ * `key in value` without running a Proxy `has` trap untainted: walks own
+ * descriptors up the prototype chain (same inherited-property semantics as
+ * `in`), tainting and falling back to `Reflect.has` when a Proxy appears.
+ */
+export function passiveHas(value: object, key: string | symbol): boolean {
+  let target: object | null = value;
+  if (types.isProxy(target)) {
+    taintSerialization('proxy');
+    return Reflect.has(value, key);
+  }
+  while (target !== null) {
+    if (Object.getOwnPropertyDescriptor(target, key) !== undefined) {
+      return true;
+    }
+    target = Object.getPrototypeOf(target);
+    if (target !== null && types.isProxy(target)) {
+      taintSerialization('proxy in prototype chain');
+      return Reflect.has(target, key);
+    }
   }
   return false;
 }
@@ -446,9 +479,9 @@ function hardenedTag(value: object): string {
 /**
  * The `operations` override passed to every `stringify` call. Only the
  * operations that could execute value-owned code (or dispatch through a
- * patchable prototype) are replaced; structural ones (`objectShape`,
- * `arrayIndices`, `hasOwnIndex`, …) already use passive engine-level
- * primitives in devalue itself.
+ * patchable prototype) are replaced; structural ones (`arrayIndices`,
+ * `hasOwnIndex`, …) already use passive engine-level primitives in devalue
+ * itself. (`objectShape` is wrapped only to taint Proxy prototypes.)
  */
 const hardenedOperations = {
   typeOf(value: unknown): string {
@@ -481,10 +514,22 @@ const hardenedOperations = {
     return (value as { valueOf(): unknown }).valueOf();
   },
 
+  // The tag-dispatched operations below can be reached without the matching
+  // brand: `hardenedTag` falls back to a (data-property) Symbol.toStringTag
+  // probe, so an object *tagged* 'Map'/'Date'/… lands in the corresponding
+  // case just like it does under stock devalue's Object.prototype.toString.
+  // The captured intrinsics would throw a brand-check TypeError on such a
+  // value where stock devalue serialized it dynamically, so each operation
+  // brand-checks first and otherwise taints + preserves the stock behavior.
+
   dateISO(value: Date): string {
-    return Number.isNaN(dateGetDate.call(value))
-      ? ''
-      : dateToISOString.call(value);
+    if (types.isDate(value)) {
+      return Number.isNaN(dateGetDate.call(value))
+        ? ''
+        : dateToISOString.call(value);
+    }
+    taintSerialization('Date tag without Date brand');
+    return defaultOperations.dateISO(value);
   },
 
   toStringValue(value: object): string {
@@ -497,14 +542,28 @@ const hardenedOperations = {
   },
 
   regExp(value: RegExp): { source: string; flags: string } {
-    return {
-      source: regExpSource.call(value) as string,
-      flags: intrinsicRegExpFlags(value),
-    };
+    if (types.isRegExp(value)) {
+      return {
+        source: regExpSource.call(value) as string,
+        flags: intrinsicRegExpFlags(value),
+      };
+    }
+    taintSerialization('RegExp tag without RegExp brand');
+    return defaultOperations.regExp(value);
   },
 
-  setValues: intrinsicSetValues,
-  mapEntries: intrinsicMapEntries,
+  setValues(value: Set<unknown>): Iterable<unknown> {
+    if (types.isSet(value)) return intrinsicSetValues(value);
+    taintSerialization('Set tag without Set brand');
+    // Stock behavior: stringify iterates the value itself.
+    return defaultOperations.setValues(value);
+  },
+
+  mapEntries(value: Map<unknown, unknown>): Iterable<[unknown, unknown]> {
+    if (types.isMap(value)) return intrinsicMapEntries(value);
+    taintSerialization('Map tag without Map brand');
+    return defaultOperations.mapEntries(value);
+  },
 
   arrayLength(value: unknown[]): number {
     // On a genuine array `length` is an own data property, so this reads the
@@ -521,6 +580,10 @@ const hardenedOperations = {
     bufferByteLength: number;
   } {
     const isDataView = types.isDataView(value);
+    if (!isDataView && !types.isTypedArray(value)) {
+      taintSerialization('view tag without view brand');
+      return defaultOperations.viewInfo(value);
+    }
     const buffer = (
       isDataView ? dataViewBuffer.call(value) : typedArrayBuffer.call(value)
     ) as ArrayBufferLike;
@@ -543,6 +606,19 @@ const hardenedOperations = {
       length: isDataView ? undefined : (typedArrayLength.call(value) as number),
       bufferByteLength,
     };
+  },
+
+  objectShape(value: object) {
+    // The default implementation reads the value's prototype (and the
+    // prototype's own property names) to detect plain objects. Both run
+    // traps when the *prototype* is a Proxy — the value itself already
+    // taints at typeOf — so taint that case before the default touches it.
+    // Deeper chain members are only read as values, never trapped.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== null && types.isProxy(proto)) {
+      taintSerialization('proxy in prototype chain');
+    }
+    return defaultOperations.objectShape(value);
   },
 
   get(value: object, key: string | number): unknown {

@@ -85,7 +85,7 @@
     "./_workflow": "./dist/workflow/index.js"
   },
   "scripts": {
-    "build": "genversion --es6 src/version.ts && tsc",
+    "build": "genversion --es6 src/version.ts && tsc && cp src/vendor/devalue/LICENSE src/vendor/devalue/README.md dist/vendor/devalue/",
     "dev": "genversion --es6 src/version.ts && tsc --watch",
     "clean": "tsc --build --clean && rm -rf dist src/version.ts docs ||:",
     "test": "cross-env WORKFLOW_TARGET_WORLD=local vitest run src",
