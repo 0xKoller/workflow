@@ -18,10 +18,12 @@
  *
  * 1. **Hardening** — every introspection devalue performs goes through the
  *    `operations` override below, built on captured intrinsics that read
- *    internal slots (cross-realm safe, immune to prototype patching). The
- *    reducers in ./reducers/ are built the same way (`util.types` brand
- *    checks + captured originals). For well-behaved values the serialized
- *    bytes are identical to plain devalue — see byte-stability.test.ts.
+ *    internal slots (cross-realm safe, immune to prototype patching; the
+ *    ECMAScript ones come from a pristine VM realm so patches applied
+ *    before this module loaded can't hide in them). The reducers in
+ *    ./reducers/ are built the same way (`util.types` brand checks +
+ *    captured originals). For well-behaved values the serialized bytes are
+ *    identical to plain devalue — see byte-stability.test.ts.
  *
  * 2. **Tainting** — where behavior preservation *requires* running value-
  *    owned code (own getters, proxy traps, custom `WORKFLOW_SERIALIZE`
@@ -34,6 +36,7 @@
  */
 
 import { types } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { defaultOperations, stringify } from '../vendor/devalue/index.js';
 
 // ---------------------------------------------------------------------------
@@ -76,30 +79,68 @@ export function taintSerialization(reason: string): void {
 // ---------------------------------------------------------------------------
 // Captured intrinsics
 // ---------------------------------------------------------------------------
-// Captured once at module load from the host realm. All of them read internal
-// slots, so they work on values from any realm (e.g. the workflow VM) and are
-// unaffected by later prototype patching in any realm.
+// Invoking a captured member must never run code an application can replace.
+// A capture taken from the host realm can't guarantee that: code that ran
+// *before this module loaded* (a polyfill, an instrumentation shim) may
+// already have patched the prototype, and the patch would then be invoked
+// as "passive" forever. So every ECMAScript intrinsic below is captured
+// from a freshly created VM realm that no user code has ever touched. They
+// all read internal slots, so they work on values from any realm (host or
+// workflow VM) and are unaffected by prototype patching in any realm.
+//
+// Host web APIs (URL, URLSearchParams, AbortController/AbortSignal,
+// Headers, DOMException) do not exist in a bare VM realm and are
+// implemented in JavaScript inside Node (so they don't even stringify as
+// native code); there is no patch-proof source for them, and they are
+// captured from the host realm at module load. The residual trust — shared
+// with `util.types` brand checks, the statics the vendored devalue
+// dispatches internally, and an `Error.prepareStackTrace` installed before
+// this module loaded — is that code loaded before @workflow/core has not
+// patched them.
+
+/**
+ * Source realm for ECMAScript intrinsics: a fresh VM realm when available,
+ * the host realm otherwise (environments without a working `node:vm`, where
+ * behavior falls back to plain module-load captures).
+ */
+const pristine: typeof globalThis = (() => {
+  try {
+    return runInNewContext('globalThis');
+  } catch {
+    return globalThis;
+  }
+})();
+
+// Statics this module itself dispatches during passive reads, captured for
+// the same reason as the prototype members: a patched
+// `Object.getPrototypeOf` must not run inside a "passive" helper.
+const getOwnPropertyDescriptor = pristine.Object.getOwnPropertyDescriptor;
+const getPrototypeOf = pristine.Object.getPrototypeOf;
+const reflectGet = pristine.Reflect.get;
+const reflectHas = pristine.Reflect.has;
+const arrayIsArray = pristine.Array.isArray;
+const numberIsNaN = pristine.Number.isNaN;
 
 function protoGetter(prototype: object, name: string | symbol) {
   // biome-ignore lint/style/noNonNullAssertion: intrinsic accessors always exist
-  return Object.getOwnPropertyDescriptor(prototype, name)!.get!;
+  return getOwnPropertyDescriptor(prototype, name)!.get!;
 }
 
-const DatePrototype = Date.prototype;
+const DatePrototype = pristine.Date.prototype;
 const dateGetDate = DatePrototype.getDate;
 const dateGetTime = DatePrototype.getTime;
 const dateToISOString = DatePrototype.toISOString;
 
-const mapEntriesIntrinsic = Map.prototype.entries;
-const mapIteratorNext = Object.getPrototypeOf(new Map().entries()).next as (
-  this: unknown
-) => IteratorResult<[unknown, unknown]>;
-const setValuesIntrinsic = Set.prototype.values;
-const setIteratorNext = Object.getPrototypeOf(new Set().values()).next as (
-  this: unknown
-) => IteratorResult<unknown>;
+const mapEntriesIntrinsic = pristine.Map.prototype.entries;
+const mapIteratorNext = getPrototypeOf(
+  mapEntriesIntrinsic.call(new pristine.Map())
+).next as (this: unknown) => IteratorResult<[unknown, unknown]>;
+const setValuesIntrinsic = pristine.Set.prototype.values;
+const setIteratorNext = getPrototypeOf(
+  setValuesIntrinsic.call(new pristine.Set())
+).next as (this: unknown) => IteratorResult<unknown>;
 
-const regExpSource = protoGetter(RegExp.prototype, 'source');
+const regExpSource = protoGetter(pristine.RegExp.prototype, 'source');
 // `RegExp.prototype.flags` is NOT internal-slot-only: the spec has it do
 // ordinary Gets of `global`, `ignoreCase`, … on the receiver, which would
 // dispatch own getters or patched per-flag accessors. Compose the flags
@@ -120,7 +161,7 @@ const regExpFlagGetters: ReadonlyArray<
     ['y', 'sticky'],
   ] as const
 ).flatMap(([flag, name]) => {
-  const get = Object.getOwnPropertyDescriptor(RegExp.prototype, name)?.get;
+  const get = getOwnPropertyDescriptor(pristine.RegExp.prototype, name)?.get;
   return get ? [[flag, get] as [string, (this: unknown) => unknown]] : [];
 });
 
@@ -133,8 +174,8 @@ export function intrinsicRegExpFlags(value: RegExp): string {
   return flags;
 }
 
-const typedArrayPrototype = Object.getPrototypeOf(
-  Uint8Array.prototype
+const typedArrayPrototype = getPrototypeOf(
+  pristine.Uint8Array.prototype
 ) as object;
 const typedArrayBuffer = protoGetter(typedArrayPrototype, 'buffer');
 const typedArrayByteOffset = protoGetter(typedArrayPrototype, 'byteOffset');
@@ -146,25 +187,35 @@ const typedArrayTag = protoGetter(typedArrayPrototype, Symbol.toStringTag) as (
   this: unknown
 ) => string | undefined;
 
-const dataViewBuffer = protoGetter(DataView.prototype, 'buffer');
-const dataViewByteOffset = protoGetter(DataView.prototype, 'byteOffset');
-const dataViewByteLength = protoGetter(DataView.prototype, 'byteLength');
+const dataViewBuffer = protoGetter(pristine.DataView.prototype, 'buffer');
+const dataViewByteOffset = protoGetter(
+  pristine.DataView.prototype,
+  'byteOffset'
+);
+const dataViewByteLength = protoGetter(
+  pristine.DataView.prototype,
+  'byteLength'
+);
 
-const arrayBufferByteLength = protoGetter(ArrayBuffer.prototype, 'byteLength');
+const arrayBufferByteLength = protoGetter(
+  pristine.ArrayBuffer.prototype,
+  'byteLength'
+);
 const sharedArrayBufferByteLength =
-  typeof SharedArrayBuffer === 'function'
-    ? protoGetter(SharedArrayBuffer.prototype, 'byteLength')
+  typeof pristine.SharedArrayBuffer === 'function'
+    ? protoGetter(pristine.SharedArrayBuffer.prototype, 'byteLength')
     : undefined;
 
-const numberValueOf = Number.prototype.valueOf;
-const stringValueOf = String.prototype.valueOf;
-const booleanValueOf = Boolean.prototype.valueOf;
-const bigIntValueOf = BigInt.prototype.valueOf;
+const numberValueOf = pristine.Number.prototype.valueOf;
+const stringValueOf = pristine.String.prototype.valueOf;
+const booleanValueOf = pristine.Boolean.prototype.valueOf;
+const bigIntValueOf = pristine.BigInt.prototype.valueOf;
 
 // URL / URLSearchParams / Headers / DOMException are host classes that the
 // workflow VM receives by reference (see vm/index.ts), so instances from
 // either realm carry the host brand and these captured members work on all
-// of them.
+// of them. Captured from the host realm at module load — see the
+// residual-trust note above.
 const urlHref = protoGetter(URL.prototype, 'href');
 const urlSearchParamsToString = URLSearchParams.prototype.toString;
 // Native AbortController/AbortSignal expose `signal` / `aborted` / `reason`
@@ -175,9 +226,8 @@ const abortControllerSignal = protoGetter(AbortController.prototype, 'signal');
 const abortSignalAborted = protoGetter(AbortSignal.prototype, 'aborted');
 const abortSignalReason = protoGetter(AbortSignal.prototype, 'reason');
 const headersIteratorIntrinsic = Headers.prototype[Symbol.iterator];
-const headersIteratorNext = Object.getPrototypeOf(
-  new Headers()[Symbol.iterator]()
-).next as (this: unknown) => IteratorResult<[string, string]>;
+const headersIteratorNext = getPrototypeOf(new Headers()[Symbol.iterator]())
+  .next as (this: unknown) => IteratorResult<[string, string]>;
 const domExceptionMessage = protoGetter(DOMException.prototype, 'message');
 const domExceptionName = protoGetter(DOMException.prototype, 'name');
 
@@ -199,6 +249,10 @@ export const capturedIntrinsics = {
   domExceptionName,
 } as const;
 
+// The helpers below collect into local arrays via index assignment rather
+// than `.push`, which would dispatch a patchable Array.prototype method
+// mid-serialization.
+
 /** Materialize a Headers' entries without dispatching on the value. */
 export function intrinsicHeadersEntries(
   headers: Headers
@@ -208,7 +262,7 @@ export function intrinsicHeadersEntries(
   for (;;) {
     const result = headersIteratorNext.call(iterator);
     if (result.done) return entries;
-    entries.push(result.value);
+    entries[entries.length] = result.value;
   }
 }
 
@@ -221,7 +275,7 @@ export function intrinsicMapEntries(
   for (;;) {
     const result = mapIteratorNext.call(iterator);
     if (result.done) return entries;
-    entries.push(result.value);
+    entries[entries.length] = result.value;
   }
 }
 
@@ -232,7 +286,7 @@ export function intrinsicSetValues(set: Set<unknown>): unknown[] {
   for (;;) {
     const result = setIteratorNext.call(iterator);
     if (result.done) return values;
-    values.push(result.value);
+    values[values.length] = result.value;
   }
 }
 
@@ -259,10 +313,10 @@ export function passiveGet(
   let target: object | null = value;
   if (types.isProxy(target)) {
     taintSerialization('proxy');
-    return Reflect.get(value, key);
+    return reflectGet(value, key);
   }
   while (target !== null) {
-    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    const descriptor = getOwnPropertyDescriptor(target, key);
     if (descriptor !== undefined) {
       if ('value' in descriptor) return descriptor.value;
       if (descriptor.get === undefined) return undefined;
@@ -270,12 +324,12 @@ export function passiveGet(
         return allowedGetter.call(value);
       }
       taintSerialization(`accessor property "${String(key)}"`);
-      return Reflect.get(value, key);
+      return reflectGet(value, key);
     }
-    target = Object.getPrototypeOf(target);
+    target = getPrototypeOf(target);
     if (target !== null && types.isProxy(target)) {
       taintSerialization('proxy in prototype chain');
-      return Reflect.get(value, key);
+      return reflectGet(value, key);
     }
   }
   return undefined;
@@ -289,7 +343,7 @@ export function passiveGet(
 // untainted only when (a) the own getter is a known engine stack getter for
 // its realm and (b) that realm's `Error.prepareStackTrace` is unset at read
 // time.
-const hostErrorStackGetter = Object.getOwnPropertyDescriptor(
+const hostErrorStackGetter = getOwnPropertyDescriptor(
   new Error(),
   'stack'
 )?.get;
@@ -305,10 +359,15 @@ interface RealmErrorIntrinsics {
   initialPrepareStackTrace: unknown;
 }
 
-const realmErrorIntrinsics = new WeakMap<object, RealmErrorIntrinsics>();
+// A pristine-realm WeakMap so lookups during serialization dispatch pristine
+// prototype methods, not patchable host ones.
+const realmErrorIntrinsics = new pristine.WeakMap() as WeakMap<
+  object,
+  RealmErrorIntrinsics
+>;
 
 function readPrepareStackTrace(ctor: ErrorConstructor): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(ctor, 'prepareStackTrace');
+  const descriptor = getOwnPropertyDescriptor(ctor, 'prepareStackTrace');
   // An accessor for it never matches any captured data value, so it reads
   // as "replaced" and taints — which is right, since invoking the engine
   // stack getter would call that accessor.
@@ -330,7 +389,7 @@ export function registerRealmSerializationIntrinsics(
   if (realmErrorIntrinsics.has(realmGlobal)) return;
   const errorCtor = (realmGlobal as { Error?: ErrorConstructor }).Error;
   if (typeof errorCtor !== 'function') return;
-  const stackGetter = Object.getOwnPropertyDescriptor(
+  const stackGetter = getOwnPropertyDescriptor(
     new errorCtor('probe'),
     'stack'
   )?.get;
@@ -341,7 +400,10 @@ export function registerRealmSerializationIntrinsics(
   });
 }
 
-// The host realm is pristine at module load; register it like any other.
+// Register the host realm at module load. Best-effort: an
+// `Error.prepareStackTrace` installed *before* this module loaded becomes
+// the pristine baseline (see the residual-trust note above) — a mismatch in
+// the other direction only ever taints, which is safe.
 registerRealmSerializationIntrinsics(globalThis);
 
 /** Whether realm code replaced the realm's pristine `prepareStackTrace`. */
@@ -361,7 +423,7 @@ export function passiveErrorStackRead(
   error: object,
   global: object = globalThis
 ): unknown {
-  const descriptor = Object.getOwnPropertyDescriptor(error, 'stack');
+  const descriptor = getOwnPropertyDescriptor(error, 'stack');
   if (descriptor !== undefined) {
     if ('value' in descriptor) return descriptor.value;
     if (descriptor.get === undefined) return undefined;
@@ -386,7 +448,7 @@ export function passiveErrorStackRead(
     taintSerialization(
       owner !== undefined ? 'Error.prepareStackTrace' : 'stack accessor'
     );
-    return Reflect.get(error, 'stack');
+    return reflectGet(error, 'stack');
   }
   return passiveGet(error, 'stack');
 }
@@ -411,7 +473,7 @@ export function isInstanceOfPrototype(
     if (types.isProxy(node)) {
       taintSerialization('proxy in prototype chain');
     }
-    const proto: object | null = Object.getPrototypeOf(node);
+    const proto: object | null = getPrototypeOf(node);
     if (proto === null) return false;
     if (proto === prototype) return true;
     node = proto;
@@ -427,16 +489,16 @@ export function passiveHas(value: object, key: string | symbol): boolean {
   let target: object | null = value;
   if (types.isProxy(target)) {
     taintSerialization('proxy');
-    return Reflect.has(value, key);
+    return reflectHas(value, key);
   }
   while (target !== null) {
-    if (Object.getOwnPropertyDescriptor(target, key) !== undefined) {
+    if (getOwnPropertyDescriptor(target, key) !== undefined) {
       return true;
     }
-    target = Object.getPrototypeOf(target);
+    target = getPrototypeOf(target);
     if (target !== null && types.isProxy(target)) {
       taintSerialization('proxy in prototype chain');
-      return Reflect.has(target, key);
+      return reflectHas(target, key);
     }
   }
   return false;
@@ -455,7 +517,7 @@ export function passiveHas(value: object, key: string | symbol): boolean {
  * 'Object'/'Function'; an accessor taints and is read like the original).
  */
 function hardenedTag(value: object): string {
-  if (Array.isArray(value)) return 'Array';
+  if (arrayIsArray(value)) return 'Array';
   if (types.isDate(value)) return 'Date';
   if (types.isMap(value)) return 'Map';
   if (types.isSet(value)) return 'Set';
@@ -524,7 +586,7 @@ const hardenedOperations = {
 
   dateISO(value: Date): string {
     if (types.isDate(value)) {
-      return Number.isNaN(dateGetDate.call(value))
+      return numberIsNaN(dateGetDate.call(value))
         ? ''
         : dateToISOString.call(value);
     }
@@ -566,7 +628,7 @@ const hardenedOperations = {
   },
 
   arrayLength(value: unknown[]): number {
-    if (!Array.isArray(value)) {
+    if (!arrayIsArray(value)) {
       // Tag-spoofed 'Array': the serializer loop coerces this length (which
       // can run an object-valued length's valueOf/Symbol.toPrimitive), so
       // taint and preserve the stock read.
@@ -631,7 +693,7 @@ const hardenedOperations = {
     // probe for Proxy values (already tainted): it would run their
     // getPrototypeOf trap one extra time relative to stock devalue.
     if (!types.isProxy(value)) {
-      const proto = Object.getPrototypeOf(value);
+      const proto = getPrototypeOf(value);
       if (proto !== null && types.isProxy(proto)) {
         taintSerialization('proxy in prototype chain');
       }
@@ -646,13 +708,13 @@ const hardenedOperations = {
       // trap). Taint — typeOf already did, but `get` can also be reached
       // through reducer-produced wrappers — and preserve the stock read.
       taintSerialization('proxy');
-      return Reflect.get(value, key);
+      return reflectGet(value, key);
     }
     // devalue only reads keys it discovered via Object.keys/Object.hasOwn.
     // Reading own data properties from the descriptor never executes code;
     // own accessors taint and then run exactly as a plain `value[key]` read
     // would.
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    const descriptor = getOwnPropertyDescriptor(value, key);
     if (descriptor !== undefined && 'value' in descriptor) {
       return descriptor.value;
     }
@@ -660,7 +722,7 @@ const hardenedOperations = {
       return undefined;
     }
     taintSerialization(`getter for "${String(key)}"`);
-    return Reflect.get(value, key);
+    return reflectGet(value, key);
   },
 };
 

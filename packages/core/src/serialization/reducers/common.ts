@@ -425,25 +425,37 @@ export function getCommonReducers(
       if (!isInstanceOfPrototype(value, URLSearchParams.prototype)) {
         return false;
       }
-      // `String(value)` dispatches Symbol.toPrimitive/toString; use the
-      // captured toString when the value resolves to the pristine one, and
-      // taint + preserve the dynamic behavior otherwise.
-      let str: string;
+      // Emptiness must come from the *native* representation: empty params
+      // serialize to the sentinel '.' without ever consulting the value's
+      // own (possibly overridden) toString — the same decision the previous
+      // `size === 0` probe made, minus the `size` getter that older Node 18
+      // releases lack.
+      let nativeString: string;
+      try {
+        nativeString = capturedIntrinsics.urlSearchParamsToString.call(
+          value
+        ) as string;
+      } catch {
+        // Prototype-chain match without the URLSearchParams brand: the
+        // captured toString brand-checks and throws where the previous code
+        // read a (likely missing) `size` and stringified dynamically. Taint
+        // and preserve that behavior.
+        taintSerialization('URLSearchParams tag without brand');
+        return passiveGet(value as object, 'size') === 0 ? '.' : String(value);
+      }
+      if (nativeString === '') return '.';
+      // Nonempty: previous behavior dispatched `String(value)`. Keep those
+      // bytes — use the captured toString when the value resolves to it, and
+      // taint + dispatch dynamically otherwise.
       if (
         passiveGet(value as object, Symbol.toPrimitive) === undefined &&
         passiveGet(value as object, 'toString') ===
           capturedIntrinsics.urlSearchParamsToString
       ) {
-        str = capturedIntrinsics.urlSearchParamsToString.call(value);
-      } else {
-        taintSerialization('URLSearchParams toString dispatch');
-        str = String(value);
+        return nativeString;
       }
-      // Empty params serialize to '' which is falsy (a reducer returning ''
-      // declines the value), so encode them as '.' — same emptiness check as
-      // `size === 0` without depending on the `size` getter, which older
-      // Node 18 releases lack.
-      return str === '' ? '.' : str;
+      taintSerialization('URLSearchParams toString dispatch');
+      return String(value);
     },
     Uint8Array: (value) => types.isUint8Array(value) && viewToBase64(value),
     Uint8ClampedArray: (value) =>

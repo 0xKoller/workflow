@@ -1,5 +1,5 @@
 import { createContext, runInContext } from 'node:vm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { dehydrateStepArguments } from '../serialization.js';
 import { stringify } from '../vendor/devalue/index.js';
 import {
@@ -365,6 +365,32 @@ describe('hardenedStringify passivity', () => {
       }
     });
 
+    it('derives URLSearchParams emptiness natively, ignoring a toString override', () => {
+      const params = new URLSearchParams();
+      let called = 0;
+      Object.defineProperty(params, 'toString', {
+        value: () => {
+          called++;
+          return 'injected=1';
+        },
+      });
+      const { output, report } = run(params);
+      // Serializes as empty (the sentinel), like the pre-hardening
+      // `size === 0` probe — without ever invoking the override.
+      expect(output).toBe(run(new URLSearchParams()).output);
+      expect(called).toBe(0);
+      expect(report.tainted).toBe(false);
+    });
+
+    it('taints and keeps dynamic bytes for nonempty URLSearchParams with overridden toString', () => {
+      const params = new URLSearchParams('a=1');
+      Object.defineProperty(params, 'toString', { value: () => 'x=y' });
+      const { output, report } = run(params);
+      expect(report.tainted).toBe(true);
+      expect(report.reasons).toContain('URLSearchParams toString dispatch');
+      expect(output).toBe(run(new URLSearchParams('x=y')).output);
+    });
+
     it('serializes RegExp flags without dispatching an own flag getter', () => {
       const value = /ab+c/gi;
       let called = false;
@@ -380,6 +406,59 @@ describe('hardenedStringify passivity', () => {
       expect(output).toBe(
         stringify(/ab+c/gi, getCommonReducers() as Record<string, any>)
       );
+    });
+  });
+
+  describe('prototypes patched before module load (pristine-realm captures)', () => {
+    // Module-load captures from the host realm cannot be trusted either:
+    // application code (a polyfill, an instrumentation shim) may patch a
+    // prototype before @workflow/core is imported, and the patch would then
+    // be invoked as "passive" forever. The ECMAScript intrinsics therefore
+    // come from a freshly created VM realm — simulated here by patching
+    // first and only then importing a fresh copy of the module.
+    it('does not dispatch a Map.prototype.entries patched before import', async () => {
+      const original = Map.prototype.entries;
+      const value = () => new Map<unknown, unknown>([['k', 1]]);
+      const expected = stringify(value());
+      let called = 0;
+      Map.prototype.entries = function (this: Map<unknown, unknown>) {
+        called++;
+        return original.call(this);
+      } as typeof Map.prototype.entries;
+      try {
+        vi.resetModules();
+        const fresh = await import('./operations.js');
+        const report = freshReport();
+        expect(fresh.hardenedStringify(value(), {}, report)).toBe(expected);
+        expect(called).toBe(0);
+        expect(report.tainted).toBe(false);
+      } finally {
+        Map.prototype.entries = original;
+        vi.resetModules();
+      }
+    });
+
+    it('does not dispatch a Date.prototype.toISOString patched before import', async () => {
+      const original = Date.prototype.toISOString;
+      const expected = stringify(new Date(1700000000000));
+      let called = 0;
+      Date.prototype.toISOString = function (this: Date) {
+        called++;
+        return original.call(this);
+      };
+      try {
+        vi.resetModules();
+        const fresh = await import('./operations.js');
+        const report = freshReport();
+        expect(
+          fresh.hardenedStringify(new Date(1700000000000), {}, report)
+        ).toBe(expected);
+        expect(called).toBe(0);
+        expect(report.tainted).toBe(false);
+      } finally {
+        Date.prototype.toISOString = original;
+        vi.resetModules();
+      }
     });
   });
 
