@@ -420,24 +420,25 @@ export function getCommonReducers(
       if (!isInstanceOfPrototype(value, URLSearchParams.prototype)) {
         return false;
       }
-      const size = passiveGet(
-        value as object,
-        'size',
-        capturedIntrinsics.urlSearchParamsSize
-      ) as number;
-      if (size === 0) return '.';
       // `String(value)` dispatches Symbol.toPrimitive/toString; use the
       // captured toString when the value resolves to the pristine one, and
       // taint + preserve the dynamic behavior otherwise.
+      let str: string;
       if (
         passiveGet(value as object, Symbol.toPrimitive) === undefined &&
         passiveGet(value as object, 'toString') ===
           capturedIntrinsics.urlSearchParamsToString
       ) {
-        return capturedIntrinsics.urlSearchParamsToString.call(value);
+        str = capturedIntrinsics.urlSearchParamsToString.call(value);
+      } else {
+        taintSerialization('URLSearchParams toString dispatch');
+        str = String(value);
       }
-      taintSerialization('URLSearchParams toString dispatch');
-      return String(value);
+      // Empty params serialize to '' which is falsy (a reducer returning ''
+      // declines the value), so encode them as '.' — same emptiness check as
+      // `size === 0` without depending on the `size` getter, which older
+      // Node 18 releases lack.
+      return str === '' ? '.' : str;
     },
     Uint8Array: (value) => types.isUint8Array(value) && viewToBase64(value),
     Uint8ClampedArray: (value) =>

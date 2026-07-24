@@ -34,7 +34,7 @@
  */
 
 import { types } from 'node:util';
-import { stringify } from 'devalue';
+import { stringify } from '../vendor/devalue/index.js';
 
 // ---------------------------------------------------------------------------
 // Passivity taint context
@@ -166,8 +166,14 @@ const bigIntValueOf = BigInt.prototype.valueOf;
 // either realm carry the host brand and these captured members work on all
 // of them.
 const urlHref = protoGetter(URL.prototype, 'href');
-const urlSearchParamsSize = protoGetter(URLSearchParams.prototype, 'size');
 const urlSearchParamsToString = URLSearchParams.prototype.toString;
+// Native AbortController/AbortSignal expose `signal` / `aborted` / `reason`
+// as prototype accessors. (The workflow VM's WorkflowAbortController /
+// WorkflowAbortSignal use plain data properties instead, which passiveGet
+// reads without needing an allowed getter.)
+const abortControllerSignal = protoGetter(AbortController.prototype, 'signal');
+const abortSignalAborted = protoGetter(AbortSignal.prototype, 'aborted');
+const abortSignalReason = protoGetter(AbortSignal.prototype, 'reason');
 const headersIteratorIntrinsic = Headers.prototype[Symbol.iterator];
 const headersIteratorNext = Object.getPrototypeOf(
   new Headers()[Symbol.iterator]()
@@ -185,8 +191,10 @@ export const capturedIntrinsics = {
   typedArrayByteLength,
   regExpSource,
   urlHref,
-  urlSearchParamsSize,
   urlSearchParamsToString,
+  abortControllerSignal,
+  abortSignalAborted,
+  abortSignalReason,
   domExceptionMessage,
   domExceptionName,
 } as const;

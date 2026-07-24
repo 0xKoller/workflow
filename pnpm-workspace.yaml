@@ -43,14 +43,6 @@ overrides:
   # next.js's postcss@8.4.31) onto a patched version.
   'postcss@<8.5.12': 8.5.16
 
-# devalue 5.8.1 + the pending `operations` option from
-# https://github.com/sveltejs/devalue/pull/172 (head 2e97724, adapted to the
-# 5.8.1 release: its merged TypedArray/DataView case is preserved so encoded
-# output stays byte-identical). Drop the patch and bump the catalog version
-# once #172 ships in a release.
-patchedDependencies:
-  devalue@5.8.1: patches/devalue@5.8.1.patch
-
 savePrefix: ""
 
 minimumReleaseAge: 2880

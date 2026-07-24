@@ -65,11 +65,6 @@ overrides:
   '@sveltejs/acorn-typescript': 1.0.10
   postcss@<8.5.12: 8.5.16
 
-patchedDependencies:
-  devalue@5.8.1:
-    hash: 5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f
-    path: patches/devalue@5.8.1.patch
-
 importers:
 
   .:
@@ -557,9 +552,6 @@ importers:
       debug:
         specifier: 4.4.3
         version: 4.4.3(supports-color@8.1.1)
-      devalue:
-        specifier: 5.8.1
-        version: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
       ms:
         specifier: 2.1.3
         version: 2.1.3
@@ -19483,7 +19475,7 @@ snapshots:
       consola: 3.4.2
       defu: 6.1.7
       destr: 2.0.5
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       errx: 0.1.0
       escape-string-regexp: 5.0.0
       exsolve: 1.0.8
@@ -19553,7 +19545,7 @@ snapshots:
       consola: 3.4.2
       defu: 6.1.7
       destr: 2.0.5
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       errx: 0.1.0
       escape-string-regexp: 5.0.0
       exsolve: 1.0.8
@@ -23746,7 +23738,7 @@ snapshots:
       '@types/cookie': 0.6.0
       acorn: 8.16.0
       cookie: 0.6.0
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       esm-env: 1.2.2
       kleur: 4.1.5
       magic-string: 0.30.21
@@ -23768,7 +23760,7 @@ snapshots:
       '@types/cookie': 0.6.0
       acorn: 8.16.0
       cookie: 0.6.0
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       esm-env: 1.2.2
       kleur: 4.1.5
       magic-string: 0.30.21
@@ -23790,7 +23782,7 @@ snapshots:
       '@types/cookie': 0.6.0
       acorn: 8.16.0
       cookie: 0.6.0
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       esm-env: 1.2.2
       kleur: 4.1.5
       magic-string: 0.30.21
@@ -25813,7 +25805,7 @@ snapshots:
       clsx: 2.1.1
       common-ancestor-path: 2.0.0
       cookie: 1.1.1
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       diff: 8.0.3
       dset: 3.1.4
       es-module-lexer: 2.0.0
@@ -25905,7 +25897,7 @@ snapshots:
       clsx: 2.1.1
       common-ancestor-path: 2.0.0
       cookie: 1.1.1
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       diff: 8.0.3
       dset: 3.1.4
       es-module-lexer: 2.0.0
@@ -27119,7 +27111,7 @@ snapshots:
 
   detect-node-es@1.1.0: {}
 
-  devalue@5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f): {}
+  devalue@5.8.1: {}
 
   devlop@1.1.0:
     dependencies:
@@ -30730,7 +30722,7 @@ snapshots:
       consola: 3.4.2
       cookie-es: 3.1.1
       defu: 6.1.7
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       errx: 0.1.0
       escape-string-regexp: 5.0.0
       exsolve: 1.0.8
@@ -30859,7 +30851,7 @@ snapshots:
       consola: 3.4.2
       cookie-es: 3.1.1
       defu: 6.1.7
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       errx: 0.1.0
       escape-string-regexp: 5.0.0
       exsolve: 1.0.8
@@ -33396,7 +33388,7 @@ snapshots:
       aria-query: 5.3.1
       axobject-query: 4.1.0
       clsx: 2.1.1
-      devalue: 5.8.1(patch_hash=5576befe9d7451d07dd296e2d620707736f086e9a701948109edfcd2d28ad93f)
+      devalue: 5.8.1
       esm-env: 1.2.2
       esrap: 2.2.13(@typescript-eslint/types@8.46.4)
       is-reference: 3.0.3

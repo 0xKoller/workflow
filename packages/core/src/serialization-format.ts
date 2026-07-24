@@ -7,7 +7,7 @@
  */
 
 import { getEventDataRefFields } from '@workflow/world';
-import { parse, unflatten } from 'devalue';
+import { parse, unflatten } from './vendor/devalue/index.js';
 
 // ---------------------------------------------------------------------------
 // Format prefix constants and encoding/decoding

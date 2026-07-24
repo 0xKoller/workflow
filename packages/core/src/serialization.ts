@@ -4,7 +4,6 @@ import {
   WorkflowRuntimeError,
 } from '@workflow/errors';
 import { envNumber } from '@workflow/world';
-import { parse, unflatten } from 'devalue';
 import { monotonicFactory } from 'ulid';
 import {
   decrypt as aesGcmDecrypt,
@@ -52,6 +51,7 @@ import {
 // side-effect-free operations (and passivity tainting) apply uniformly —
 // see ./serialization/operations.ts.
 import {
+  capturedIntrinsics,
   isInstanceOfPrototype,
   passiveGet,
   type SerializationPassivityReport,
@@ -97,6 +97,7 @@ import {
 import * as Attr from './telemetry/semantic-conventions.js';
 import { getActiveSpan, getSpanKind, recordElapsedSpan } from './telemetry.js';
 import { getAbortStreamId } from './util.js';
+import { parse, unflatten } from './vendor/devalue/index.js';
 import { WorkflowAbortSignal } from './workflow/abort-controller.js';
 
 // Re-export types and utilities from the modular serialization modules
@@ -1466,18 +1467,35 @@ function reduceAbortBySymbol(
   signal: { aborted: boolean; reason?: unknown },
   holder: AbortHolder
 ): AbortSerializedData | false {
-  const streamName =
-    holder[ABORT_STREAM_NAME] ?? holder.signal?.[ABORT_STREAM_NAME];
-  const hookToken =
-    holder[ABORT_HOOK_TOKEN] ?? holder.signal?.[ABORT_HOOK_TOKEN];
+  // All reads are passive: the symbols are own data properties on both the
+  // VM's Workflow* classes and reduced natives, and `aborted`/`reason` are
+  // either data properties (VM) or the captured native prototype accessors.
+  // `signal` is the holder itself (AbortSignal reducer) or was already read
+  // passively from the holder (AbortController reducer), so symbol probes on
+  // both cover holder[SYM] ?? holder.signal?.[SYM].
+  const streamName = (passiveGet(holder, ABORT_STREAM_NAME) ??
+    passiveGet(signal as object, ABORT_STREAM_NAME)) as string | undefined;
+  const hookToken = (passiveGet(holder, ABORT_HOOK_TOKEN) ??
+    passiveGet(signal as object, ABORT_HOOK_TOKEN)) as string | undefined;
   if (!streamName) {
     throw new Error('AbortController/AbortSignal stream name is not set');
   }
+  const aborted = passiveGet(
+    signal as object,
+    'aborted',
+    capturedIntrinsics.abortSignalAborted
+  ) as boolean;
   return {
     streamName,
     hookToken: hookToken!,
-    aborted: signal.aborted,
-    reason: signal.aborted ? signal.reason : undefined,
+    aborted,
+    reason: aborted
+      ? passiveGet(
+          signal as object,
+          'reason',
+          capturedIntrinsics.abortSignalReason
+        )
+      : undefined,
   };
 }
 
@@ -1773,9 +1791,11 @@ export function getWorkflowReducers(
       ) {
         return false;
       }
-      const signal = passiveGet(value, 'signal') as
-        | (AbortSignal & AbortInternals)
-        | undefined;
+      const signal = passiveGet(
+        value,
+        'signal',
+        capturedIntrinsics.abortControllerSignal
+      ) as (AbortSignal & AbortInternals) | undefined;
       if (!signal) return false;
       const holder = value as AbortController & AbortHolder;
       const hasAbortSymbol =
