@@ -79,8 +79,10 @@ async function readFileIfExists(filePath: string): Promise<string | null> {
  * Projects that use the VercelBuildOutputAPIBuilder and produce ESM step bundles.
  */
 const ESM_STEP_BUNDLE_PROJECTS: Record<string, string> = {
+  // Steps are bundled into the combined flow function (there is no separate
+  // step.func in the Build Output API layout).
   example:
-    '.vercel/output/functions/.well-known/workflow/v1/step.func/index.mjs',
+    '.vercel/output/functions/.well-known/workflow/v1/flow.func/index.mjs',
 };
 
 const DIAGNOSTICS_MANIFEST_PATHS: Record<string, string> = {
