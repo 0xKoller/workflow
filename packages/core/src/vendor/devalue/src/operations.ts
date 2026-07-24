@@ -1,9 +1,9 @@
 // @ts-nocheck
 import {
-  enumerable_symbols,
-  get_type,
-  is_plain_object,
-  valid_array_indices,
+	enumerable_symbols,
+	get_type,
+	is_plain_object,
+	valid_array_indices
 } from './utils.js';
 
 /** @type {{ kind: 'not-plain' }} */
@@ -29,55 +29,55 @@ const SYMBOL_KEYS = Object.freeze({ kind: 'symbol-keys' });
  * @type {import('./types.js').StringifyOperations}
  */
 export const default_operations = Object.freeze({
-  identify: (value) => value,
+	identify: (value) => value,
 
-  typeOf: (value) => (value === null ? 'null' : typeof value),
+	typeOf: (value) => (value === null ? 'null' : typeof value),
 
-  primitive: (value) => value,
+	primitive: (value) => value,
 
-  tag: (value) => get_type(value),
+	tag: (value) => get_type(value),
 
-  isThenable: (value) => typeof value.then === 'function',
+	isThenable: (value) => typeof value.then === 'function',
 
-  resolveThenable: (value) => Promise.resolve(value),
+	resolveThenable: (value) => Promise.resolve(value),
 
-  unbox: (value) => value.valueOf(),
+	unbox: (value) => value.valueOf(),
 
-  dateISO: (value) => (isNaN(value.getDate()) ? '' : value.toISOString()),
+	dateISO: (value) => (isNaN(value.getDate()) ? '' : value.toISOString()),
 
-  toStringValue: (value) => value.toString(),
+	toStringValue: (value) => value.toString(),
 
-  regExp: (value) => ({ source: value.source, flags: value.flags }),
+	regExp: (value) => ({ source: value.source, flags: value.flags }),
 
-  setValues: (value) => value,
+	setValues: (value) => value,
 
-  mapEntries: (value) => value,
+	mapEntries: (value) => value,
 
-  viewInfo: (value) => ({
-    buffer: value.buffer,
-    byteOffset: value.byteOffset,
-    byteLength: value.byteLength,
-    length: value.length,
-    bufferByteLength: value.buffer.byteLength,
-  }),
+	viewInfo: (value) => ({
+		buffer: value.buffer,
+		byteOffset: value.byteOffset,
+		byteLength: value.byteLength,
+		length: value.length,
+		bufferByteLength: value.buffer.byteLength
+	}),
 
-  arrayBuffer: (value) => value,
+	arrayBuffer: (value) => value,
 
-  arrayLength: (value) => value.length,
+	arrayLength: (value) => value.length,
 
-  hasOwnIndex: (value, index) => Object.hasOwn(value, index),
+	hasOwnIndex: (value, index) => Object.hasOwn(value, index),
 
-  arrayIndices: (value) => valid_array_indices(value),
+	arrayIndices: (value) => valid_array_indices(value),
 
-  objectShape: (value) => {
-    if (!is_plain_object(value)) return NOT_PLAIN;
-    if (enumerable_symbols(value).length > 0) return SYMBOL_KEYS;
+	objectShape: (value) => {
+		if (!is_plain_object(value)) return NOT_PLAIN;
+		if (enumerable_symbols(value).length > 0) return SYMBOL_KEYS;
 
-    return {
-      kind: Object.getPrototypeOf(value) === null ? 'null-proto' : 'plain',
-      keys: Object.keys(value),
-    };
-  },
+		return {
+			kind: Object.getPrototypeOf(value) === null ? 'null-proto' : 'plain',
+			keys: Object.keys(value)
+		};
+	},
 
-  get: (value, key) => value[key],
+	get: (value, key) => value[key]
 });
