@@ -107,7 +107,7 @@ describe('hardenedStringify passivity', () => {
       });
       const { output, report } = run(value);
       expect(report.tainted).toBe(true);
-      expect(report.reasons[0]).toContain('getter for "x"');
+      expect(report.reasons[0]).toContain('accessor property "x"');
       expect(invoked).toBe(1);
       expect(output).toBe(stringify({ x: 42 }));
     });
@@ -253,6 +253,16 @@ describe('hardenedStringify passivity', () => {
       expect(output).toBe(stringify(mapLike, reducers));
       expect(report.tainted).toBe(true);
       expect(report.reasons).toContain('Map tag without Map brand');
+    });
+
+    it('throws loudly on proxied Maps and Sets instead of misparsing', () => {
+      // A proxied Map/Set would serialize into devalue's native inline
+      // encoding, which the custom 'Map'/'Set' revivers mangle on parse —
+      // the pre-hardening reducers threw a brand-check TypeError here.
+      expect(() => run(new Proxy(new Map([['k', 1]]), {}))).toThrow(
+        /proxied Map/
+      );
+      expect(() => run(new Proxy(new Set([1]), {}))).toThrow(/proxied Set/);
     });
 
     it('taints a tag-spoofed Date-like instead of throwing, preserving stock bytes', () => {

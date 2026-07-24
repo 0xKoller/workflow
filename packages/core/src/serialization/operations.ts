@@ -37,7 +37,11 @@
 
 import { types } from 'node:util';
 import { runInNewContext } from 'node:vm';
-import { defaultOperations, stringify } from '../vendor/devalue/index.js';
+import {
+  DevalueError,
+  defaultOperations,
+  stringify,
+} from '../vendor/devalue/index.js';
 
 // ---------------------------------------------------------------------------
 // Passivity taint context
@@ -497,11 +501,6 @@ export function isInstanceOfPrototype(
 }
 
 /**
- * `key in value` without running a Proxy `has` trap untainted: walks own
- * descriptors up the prototype chain (same inherited-property semantics as
- * `in`), tainting and falling back to `Reflect.has` when a Proxy appears.
- */
-/**
  * Resolved by `passivePeek` when reading the property would require running
  * value-owned code (an accessor, or a Proxy anywhere on the chain).
  */
@@ -529,6 +528,11 @@ export function passivePeek(value: object, key: string | symbol): unknown {
   return undefined;
 }
 
+/**
+ * `key in value` without running a Proxy `has` trap untainted: walks own
+ * descriptors up the prototype chain (same inherited-property semantics as
+ * `in`), tainting and falling back to `Reflect.has` when a Proxy appears.
+ */
 export function passiveHas(value: object, key: string | symbol): boolean {
   let target: object | null = value;
   if (types.isProxy(target)) {
@@ -660,6 +664,18 @@ const hardenedOperations = {
 
   setValues(value: Set<unknown>): Iterable<unknown> {
     if (types.isSet(value)) return intrinsicSetValues(value);
+    // A Proxy over a Set would serialize into devalue's native inline Set
+    // encoding, which the custom 'Set' reviver then mangles on parse. The
+    // pre-hardening reducers threw a brand-check TypeError here — keep the
+    // failure loud.
+    if (types.isProxy(value)) {
+      throw new DevalueError(
+        'Cannot serialize a proxied Set',
+        [],
+        value,
+        value
+      );
+    }
     taintSerialization('Set tag without Set brand');
     // Stock behavior: stringify iterates the value itself.
     return defaultOperations.setValues(value);
@@ -667,6 +683,15 @@ const hardenedOperations = {
 
   mapEntries(value: Map<unknown, unknown>): Iterable<[unknown, unknown]> {
     if (types.isMap(value)) return intrinsicMapEntries(value);
+    // See setValues: a proxied Map must fail loudly, not misparse.
+    if (types.isProxy(value)) {
+      throw new DevalueError(
+        'Cannot serialize a proxied Map',
+        [],
+        value,
+        value
+      );
+    }
     taintSerialization('Map tag without Map brand');
     return defaultOperations.mapEntries(value);
   },
@@ -765,7 +790,7 @@ const hardenedOperations = {
     if (descriptor !== undefined && descriptor.get === undefined) {
       return undefined;
     }
-    taintSerialization(`getter for "${String(key)}"`);
+    taintSerialization(`accessor property "${String(key)}"`);
     return reflectGet(value, key);
   },
 };
@@ -780,6 +805,11 @@ const stringifyOptions = { operations: hardenedOperations };
  * `devalue.stringify` with the hardened operations, optionally recording
  * passivity taint into `report`. Every stringify call in @workflow/core goes
  * through here so the wire format cannot depend on the caller.
+ *
+ * NOT interchangeable with `withPassivityReport`: called without a `report`,
+ * this deliberately clears any outer report for the duration (a nested
+ * stringify of a different boundary must not taint it), while
+ * `withPassivityReport(undefined, fn)` leaves the outer report active.
  */
 export function hardenedStringify(
   value: unknown,

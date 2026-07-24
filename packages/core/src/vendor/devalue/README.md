@@ -18,7 +18,8 @@ is byte-compatible with stock devalue output for well-behaved values.
 Files are the upstream JS renamed to `.ts` with a leading `// @ts-nocheck`
 (they are JSDoc-typed and compile as-is), plus `declare` property
 declarations on `DevalueError` (constructor-assignment inference is a
-JS-file-only TypeScript feature). Do not edit them beyond that; apply
-upstream diffs instead. If/when upstream merges and releases the
-operations interface, this directory should be deleted in favor of the npm
-dependency.
+JS-file-only TypeScript feature). Upstream's `uneval.ts` is omitted and
+`stringifyAsync` is not re-exported — nothing in @workflow/core uses them.
+Do not edit the vendored files beyond that; apply upstream diffs instead.
+If/when upstream merges and releases the operations interface, this
+directory should be deleted in favor of the npm dependency.
